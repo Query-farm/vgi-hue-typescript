@@ -399,6 +399,16 @@ SELECT name FROM hue.main.lights WHERE light_id = 'l-desk';
 ----
 Reading lamp
 
+# Rename and change state in one statement: a bridge ignores state sent with a
+# rename, so both must arrive (as separate requests).
+statement ok
+UPDATE hue.main.lights SET name = 'Desk lamp', is_on = true, brightness = 55 WHERE light_id = 'l-desk';
+
+query TTR
+SELECT name, is_on, brightness FROM hue.main.lights WHERE light_id = 'l-desk';
+----
+Desk lamp	true	55.0
+
 # SET can compute from the current value.
 statement ok
 UPDATE hue.main.lights SET brightness = 30 WHERE light_id = 'l-sofa';

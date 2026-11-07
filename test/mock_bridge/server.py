@@ -210,6 +210,9 @@ def apply_light(l: dict, body: dict) -> str | None:
         if not 1 <= len(name) <= 32:
             return "metadata.name must be 1-32 characters"
         l["metadata"]["name"] = name
+        # As a real bridge does: state fields sent alongside metadata are
+        # silently ignored (the request still succeeds).
+        return None
     if "on" in body:
         l["on"]["on"] = bool(body["on"]["on"])
     if "dimming" in body:

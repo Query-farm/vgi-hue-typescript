@@ -23,7 +23,7 @@ import {
   xyToHex,
 } from "../src/hue.ts";
 import { lightRowId, lightRows, roomRows, sensorRows } from "../src/inventory.ts";
-import { applyToRow, checkKnownColumns, rowChange, updateBody } from "../src/lights_write.ts";
+import { applyToRow, checkKnownColumns, rowChange, updateBody, updateRequests } from "../src/lights_write.ts";
 
 const ROOT = join(import.meta.dir, "..");
 
@@ -486,6 +486,12 @@ describe("UPDATE hue.main.lights", () => {
 
   test("the PUT body and the row RETURNING shows", () => {
     expect(updateBody({}, "Reading")).toEqual({ metadata: { name: "Reading" } });
+    // A bridge ignores state sent with metadata: the rename is its own request.
+    expect(updateRequests(updateBody({ brightness: 50 }, "Reading"))).toEqual([
+      { dimming: { brightness: 50 }, on: { on: true } },
+      { metadata: { name: "Reading" } },
+    ]);
+    expect(updateRequests({})).toEqual([]);
     const body = updateBody({ kelvin: 2700 }, null);
     expect(body).toEqual({ color_temperature: { mirek: 370 } });
     expect(applyToRow(current, body)).toMatchObject({

@@ -110,12 +110,22 @@ export function rowChange(batch: VgiBatch, i: number, current: Row): { change: L
   return { change, name };
 }
 
-/** The PUT body for one light: its state change and/or new name. */
+/** The changes for one light: its state change and/or new name. */
 export function updateBody(change: LightChange, name: string | null): Record<string, unknown> {
   const hasState = Object.values(change).some((v) => v != null);
   const body = hasState ? buildStateBody(change) : {};
   if (name !== null) body.metadata = { name };
   return body;
+}
+
+/**
+ * The PUT requests that apply `body`. A real bridge silently ignores state
+ * fields (on, dimming, colour) in a PUT that also carries `metadata`, so a
+ * rename goes in a request of its own, after the state change.
+ */
+export function updateRequests(body: Record<string, unknown>): Record<string, unknown>[] {
+  const { metadata, ...state } = body;
+  return [...(Object.keys(state).length ? [state] : []), ...(metadata ? [{ metadata }] : [])];
 }
 
 /** The row as it reads once the bridge has applied `body` (what RETURNING shows). */
@@ -184,9 +194,10 @@ export const lightsUpdateFn = defineTableInOutFunction({
       return { old, body: updateBody(change, name) };
     });
     for (const { old, body } of plan) {
-      if (Object.keys(body).length === 0) continue; // nothing differs: no command
-      await pace("light");
-      await hueRequest(conn, "PUT", `/resource/light/${old.light_id}`, body);
+      for (const request of updateRequests(body)) {
+        await pace("light");
+        await hueRequest(conn, "PUT", `/resource/light/${old.light_id}`, request);
+      }
     }
     out.emit(
       writeResultBatch(
