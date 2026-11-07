@@ -1,0 +1,37 @@
+# Template-only: proves `make init` produces a working worker. Deleted by `make init`.
+name: Template init
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - name: Initialize a copy as "acme_demo"
+        run: |
+          cp -R . /tmp/acme && cd /tmp/acme
+          git config --global user.email ci@example.com && git config --global user.name ci
+          make init NAME=acme_demo
+          git add -A && git commit -qm init
+      - name: No leftover template identifiers
+        working-directory: /tmp/acme
+        run: |
+          if git grep -n -I -i -w starter -- . ':!scripts/vgi_template.py' ':!.vgi-starter.json' \
+               | grep -v -i "starter template" | grep -v "vgi-starter-api.query-farm.services"; then
+            echo "::error::identifiers above were not renamed by make init"; exit 1
+          fi
+      - name: make check on the renamed worker
+        working-directory: /tmp/acme
+        run: make check

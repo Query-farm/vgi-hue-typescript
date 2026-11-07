@@ -1,0 +1,5 @@
+#!/bin/sh
+# Serve one recipe from examples/: run-recipe <recipe> [worker flags]
+#   ATTACH 'aggregate' (TYPE vgi, LOCATION '/abs/path/to/bin/run-recipe aggregate');
+here="$(cd "$(dirname "$0")" && pwd)"
+exec bun run "$here/../examples/run.ts" "$@"

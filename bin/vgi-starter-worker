@@ -1,0 +1,6 @@
+#!/bin/sh
+# Start the worker. DuckDB runs this as the ATTACH LOCATION:
+#   ATTACH 'starter' (TYPE vgi, LOCATION '/abs/path/to/bin/vgi-starter-worker');
+# Flags pass through: --http [--host H] [--port N], --unix PATH, --debug.
+here="$(cd "$(dirname "$0")" && pwd)"
+exec bun run "$here/../src/worker.ts" "$@"

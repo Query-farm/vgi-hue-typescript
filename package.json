@@ -1,0 +1,21 @@
+{
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A VGI worker for DuckDB, generated from the Query.Farm VGI starter template.",
+  "license": "0BSD",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@query-farm/apache-arrow": "^21.1.1",
+    "@query-farm/vgi": "~0.48.1",
+    "@query-farm/vgi-rpc": "^0.29.6"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.6",
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.0"
+  }
+}

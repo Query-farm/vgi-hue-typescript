@@ -1,0 +1,91 @@
+# name: examples/test/recipes.test
+# description: One check per recipe in examples/. RECIPES_WORKER is the command that runs
+#              a recipe by name, e.g. "/abs/.venv/bin/python /abs/examples/run.py".
+# group: [recipes]
+# managed-by: vgi-starters (edit upstream in shared/, then run tools/render.py)
+
+require vgi
+
+require-env RECIPES_WORKER
+
+# ------------------------------------------------------------ transform_rows
+statement ok
+ATTACH 'transform_rows' (TYPE vgi, LOCATION '{RECIPES_WORKER} transform_rows');
+
+query II
+SELECT id, value FROM transform_rows.main.positive_only((SELECT * FROM (VALUES (1, 5), (2, -3), (3, NULL), (4, 7)) t(id, value))) ORDER BY id;
+----
+1	5
+4	7
+
+# ------------------------------------------------------------------ aggregate
+statement ok
+ATTACH 'aggregate' (TYPE vgi, LOCATION '{RECIPES_WORKER} aggregate');
+
+query TI
+SELECT k, aggregate.main.int_sum(v) FROM (VALUES ('a', 1), ('a', 2), ('b', 10), ('b', NULL)) t(k, v) GROUP BY k ORDER BY k;
+----
+a	3
+b	10
+
+# ------------------------------------------------------------ pushdown_sqlite
+statement ok
+ATTACH 'pushdown_sqlite' (TYPE vgi, LOCATION '{RECIPES_WORKER} pushdown_sqlite');
+
+query II
+SELECT count(*), sum(amount) FROM pushdown_sqlite.main.orders();
+----
+2000	999000
+
+query II
+SELECT count(*), sum(id) FROM pushdown_sqlite.main.orders() WHERE region = 'west' AND amount > 900;
+----
+50	49150
+
+query I
+SELECT count(*) FROM pushdown_sqlite.main.orders() WHERE region IN ('north', 'east');
+----
+1000
+
+# ------------------------------------------------------- cache_expensive_call
+statement ok
+ATTACH 'cache_expensive_call' (TYPE vgi, LOCATION '{RECIPES_WORKER} cache_expensive_call');
+
+query TR
+SELECT currency, rate FROM cache_expensive_call.main.exchange_rates() ORDER BY currency;
+----
+EUR	1.09
+GBP	1.27
+JPY	0.0067
+
+# Second call: served from DuckDB's cache inside the TTL; same answer.
+query I
+SELECT count(*) FROM cache_expensive_call.main.exchange_rates();
+----
+3
+
+# ------------------------------------------------------------- catalog_tables
+statement ok
+ATTACH 'catalog_tables' (TYPE vgi, LOCATION '{RECIPES_WORKER} catalog_tables');
+
+query TT
+SELECT code, name FROM catalog_tables.main.countries WHERE continent = 'Europe' ORDER BY code;
+----
+DE	Germany
+FR	France
+
+# --------------------------------------------------------------- copy_to_sink
+statement ok
+ATTACH 'copy_to_sink' (TYPE vgi, LOCATION '{RECIPES_WORKER} copy_to_sink');
+
+statement ok
+COPY (SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t(id, label)) TO '{TEST_DIR}/recipe_out.jsonl' (FORMAT 'copy_to_sink.jsonl_out');
+
+statement ok
+LOAD json;
+
+query IT
+SELECT id, label FROM read_json('{TEST_DIR}/recipe_out.jsonl') ORDER BY id;
+----
+1	a
+2	b

@@ -1,0 +1,27 @@
+# vgi-lint settings for this worker: https://github.com/Query-farm/vgi-lint-check
+# `make lint-explain`, `vgi-lint lint` in this directory, and CI's metadata job all
+# read this file. Look up a rule with `vgi-lint explain VGI123`; print the metadata tag
+# contract with `vgi-lint spec`.
+
+# The worker to attach, relative to this directory. Build it first with `make build`.
+location = "bin/vgi-starter-worker"
+
+# template-only:start
+fail_on = "info"
+# template-only:end
+# Fail on warnings while you build. Raise this to "info" before you publish the worker.
+# fork-only: fail_on = "warning"
+
+# Waive a finding only with a kind and a reason, so the waiver can be audited:
+#   domain-exemption  permanent and legitimate for this worker
+#   deferred          a real defect you will fix; add expires = "YYYY-MM-DD"
+#   timing            slow or flaky because of the environment, not the metadata
+#   tooling-bug       the linter is wrong; report it upstream
+ignore = [
+  # { code = "VGI146", kind = "domain-exemption", reason = "every entry point needs a key" },
+]
+
+# Adopting the gate on a worker that already has findings? Record them once with
+#   vgi-lint lint --baseline vgi-lint-baseline --update-baseline
+# and uncomment the next line. Only new findings fail after that.
+# baseline = "vgi-lint-baseline"

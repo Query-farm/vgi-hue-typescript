@@ -1,0 +1,17 @@
+{
+  "template": "vgi-starter-typescript",
+  "lang": "typescript",
+  "template_version": "1.0.0",
+  "template_commit": "0000000000000000000000000000000000000000",
+  "post_init": [
+    "bun install",
+    "bun x biome format --write ."
+  ],
+  "template_only_files": [
+    ".github/workflows/template-init.yml"
+  ],
+  "optional_files": [
+    ".github/workflows/nightly.yml",
+    ".github/dependabot.yml"
+  ]
+}

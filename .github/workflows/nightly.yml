@@ -1,0 +1,35 @@
+name: Nightly
+
+# Runs CI against the newest compatible dependencies, so breakage from an upstream
+# release shows up here before it reaches a pull request. Delete this file if you
+# don't want it (make init --minimal does).
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: astral-sh/setup-uv@v6
+      - name: Upgrade the lockfile within the pinned ranges
+        run: bun update
+      - run: make lint test-unit
+      - run: make test-sql-all
+      - run: make lint-explain
+      - name: Open an issue on failure
+        if: failure() && vars.RELEASE_WINDOW != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --title "Nightly failed on $(date -u +%F)" \
+            --body "See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            || true

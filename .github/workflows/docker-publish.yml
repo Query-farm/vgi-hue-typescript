@@ -1,0 +1,39 @@
+name: Publish image
+
+# Multi-arch image to ghcr.io, signed with cosign: vX.Y.Z -> :X.Y.Z, :X.Y, :latest;
+# main -> :edge. The shared workflow smoke-tests /health before pushing.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    # The template repositories themselves publish no image; forks do.
+    if: ${{ !startsWith(github.repository, 'Query-farm/vgi-starter-') }}
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [ci]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: Query-farm/vgi-actions/.github/workflows/docker-publish.yml@v1
+    secrets: inherit
+    with:
+      image_name: vgi-starter-worker
+      # Nothing to language-import in a Bun image; the /health boot smoke still runs.
+      smoke_import: ""
+      health_port: "8000"
+      version_check_cmd: "ci/check-version.sh"
