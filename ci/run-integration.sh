@@ -79,13 +79,17 @@ export HUE_DISCOVERY_URL="$HUE_MOCK_BRIDGE/discovery"
 export HUE_DISCOVERY_SCHEME=http
 export HUE_DISCOVERY_MDNS=off
 export XDG_CACHE_HOME="$STAGE/cache"
+# Staged transaction requests go to a throwaway directory too.
+export HUE_TX_DIR="$STAGE/tx"
 
 HTTP=0
 case "$TRANSPORT" in
-  stdio)  export HUE_WORKER="$WORKER" ;;
-  launch) export HUE_WORKER="launch:$WORKER" ;;
+  stdio)  export HUE_WORKER="$WORKER"; export HUE_LOCAL_TRANSPORT=1 ;;
+  launch) export HUE_WORKER="launch:$WORKER"; export HUE_LOCAL_TRANSPORT=1 ;;
   http)
     HTTP=1
+    # Transactional attaches are local-transport only (transactions.test gates on it).
+    EXPECTED_SKIP_REASONS="${EXPECTED_SKIP_REASONS:+$EXPECTED_SKIP_REASONS$'\n'}require-env HUE_LOCAL_TRANSPORT"
     start_server "$STAGE/worker.log" "$WORKER" --http --port 0
     export HUE_WORKER="http://127.0.0.1:$PORT"
     ;;

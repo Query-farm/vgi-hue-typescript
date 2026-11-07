@@ -26,6 +26,7 @@ import {
   writeResultSchema,
 } from "@query-farm/vgi";
 import { connectionFor } from "./attach.ts";
+import { senderFor } from "./dispatch.ts";
 import {
   buildStateBody,
   getResources,
@@ -34,14 +35,9 @@ import {
   type HueGroup,
   type HueLight,
   type HueZigbee,
-  hueRequest,
-  kelvinToHex,
   type LightChange,
-  mirekToKelvin,
-  pace,
-  xyToHex,
 } from "./hue.ts";
-import { LIGHTS, lightRows } from "./inventory.ts";
+import { applyToRow, LIGHTS, lightRows } from "./inventory.ts";
 
 /** The columns `UPDATE hue.main.lights SET ...` may change. */
 export const UPDATABLE_LIGHT_COLUMNS = [
@@ -128,39 +124,7 @@ export function updateRequests(body: Record<string, unknown>): Record<string, un
   return [...(Object.keys(state).length ? [state] : []), ...(metadata ? [{ metadata }] : [])];
 }
 
-/** The row as it reads once the bridge has applied `body` (what RETURNING shows). */
-export function applyToRow(old: Row, body: Record<string, unknown>): Row {
-  const row = { ...old };
-  const b = body as {
-    on?: { on: boolean };
-    dimming?: { brightness: number };
-    color_temperature?: { mirek: number };
-    color?: { xy: { x: number; y: number } };
-    metadata?: { name: string };
-  };
-  if (b.on) row.is_on = b.on.on;
-  if (b.dimming) row.brightness = b.dimming.brightness;
-  if (b.color_temperature) {
-    const kelvin = mirekToKelvin(b.color_temperature.mirek);
-    Object.assign(row, {
-      color_mode: "color_temperature",
-      color_temperature_kelvin: kelvin,
-      color_hex: kelvinToHex(kelvin),
-    });
-  }
-  if (b.color) {
-    const { x, y } = b.color.xy;
-    Object.assign(row, {
-      color_mode: "xy",
-      color_temperature_kelvin: null,
-      color_x: x,
-      color_y: y,
-      color_hex: xyToHex(x, y),
-    });
-  }
-  if (b.metadata) row.name = b.metadata.name;
-  return row;
-}
+export { applyToRow } from "./inventory.ts";
 
 export const lightsUpdateFn = defineTableInOutFunction({
   name: "lights_update",
@@ -193,11 +157,15 @@ export const lightsUpdateFn = defineTableInOutFunction({
       const { change, name } = rowChange(batch, i, old);
       return { old, body: updateBody(change, name) };
     });
+    const send = senderFor(params.initCall.bind_call, conn);
     for (const { old, body } of plan) {
-      for (const request of updateRequests(body)) {
-        await pace("light");
-        await hueRequest(conn, "PUT", `/resource/light/${old.light_id}`, request);
-      }
+      await send(
+        updateRequests(body).map((request) => ({
+          kind: "light" as const,
+          target: String(old.light_id),
+          body: request,
+        })),
+      );
     }
     out.emit(
       writeResultBatch(

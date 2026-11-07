@@ -50,6 +50,7 @@ ATTACH 'hue' (TYPE vgi, LOCATION '/abs/path/to/hue-worker/bin/vgi-hue-worker',
 | Option | Meaning | Fallback |
 |---|---|---|
 | `app_key` | Hue application key (secret, redacted) | `HUE_APP_KEY` env var of the worker |
+| `transactional` | Optional, default `false`: stage light changes and send them at `COMMIT` (see [Transactions](#transactions)) | — |
 | `bridge` | Optional: bridge IP or host name (HTTPS is used), a full `http(s)://` URL, or a bridge id (16 hex digits) to pick one of several bridges | `HUE_BRIDGE` env var, then discovery |
 
 ### Bridge discovery
@@ -113,6 +114,38 @@ anything is sent. Each light gets one command, paced at about 10 per second. `RE
 the rows as written. Each light has a stable `rowid`, a hash of its id, which is how DuckDB
 tells the worker which lights matched.
 
+## Transactions
+
+Attach with `transactional true` and light changes wait for `COMMIT`:
+
+```sql
+ATTACH 'hue' (TYPE vgi, LOCATION '...', app_key getenv('HUE_APP_KEY'), transactional true);
+
+BEGIN;
+UPDATE hue.main.lights SET is_on = true, brightness = 40 WHERE room = 'Kitchen';
+SELECT * FROM hue.main.recall_scene('Relax', room := 'Living room');
+SELECT name, brightness FROM hue.main.lights WHERE room = 'Kitchen';  -- shows 40: your pending change
+COMMIT;      -- everything is sent now, back to back
+-- or ROLLBACK: nothing was sent, no light changed
+```
+
+- `UPDATE` and the control functions stage their requests instead of sending them. `COMMIT`
+  sends them in order, merging consecutive changes to the same light. `ROLLBACK` discards them.
+- Reads inside the transaction show its pending light changes. Staged room commands and scenes
+  aren't reflected in the lights table until they're sent.
+- The bridge has no transactions of its own. If it refuses a request part-way through a commit,
+  the lights already changed are put back to their state from before the commit, and `COMMIT`
+  fails with what happened. That's all-or-nothing in practice, not ACID: another app or a wall
+  switch can still change a light mid-transaction.
+- DuckDB runs every statement in a transaction. Outside `BEGIN`, a statement applies as it
+  commits, right after it runs, and a bridge refusal fails that statement. In a transactional
+  attach, `set_room`'s `wait_ms` has nothing to wait for (`settled` is NULL), and `set_lights`
+  reports bridge refusals at commit, not per row.
+- Local transports only (DuckDB starting the worker, or `launch:`). Over HTTP the SDK hands
+  functions the transaction id still encrypted, so the worker refuses transactional mode there.
+
+Without `transactional`, every change is sent as its statement runs, which is the default.
+
 ## Controlling with functions
 
 | Function | Changes |
@@ -163,6 +196,8 @@ src/
   inventory.ts   # lights / rooms / scenes / sensors tables
   control.ts     # set_light / set_room / recall_scene / set_lights
   lights_write.ts # UPDATE hue.main.lights (rowid -> light, SET -> one PUT per light)
+  dispatch.ts    # send a change now, or stage it in the current transaction
+  transactions.ts # staging, COMMIT (with restore on refusal), ROLLBACK
   catalog.ts     # assembles the catalog
   meta.ts        # catalog/schema metadata and helpers
 test/mock_bridge/server.py   # stateful offline mock of a Hue bridge

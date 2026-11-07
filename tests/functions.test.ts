@@ -24,6 +24,7 @@ import {
 } from "../src/hue.ts";
 import { lightRowId, lightRows, roomRows, sensorRows } from "../src/inventory.ts";
 import { applyToRow, checkKnownColumns, rowChange, updateBody, updateRequests } from "../src/lights_write.ts";
+import { coalesce, stageable } from "../src/transactions.ts";
 
 const ROOT = join(import.meta.dir, "..");
 
@@ -500,5 +501,45 @@ describe("UPDATE hue.main.lights", () => {
     });
     const red = applyToRow(current, updateBody({ color: "red", on: true }, null));
     expect(red).toMatchObject({ is_on: true, color_mode: "xy", color_temperature_kelvin: null, color_hex: "#ff0000" });
+  });
+});
+
+describe("transactions", () => {
+  const light = (target: string, body: Record<string, unknown>) => ({ kind: "light" as const, target, body });
+
+  test("back-to-back changes to one light merge; colour replaces white temperature", () => {
+    expect(
+      coalesce([
+        light("a", { dimming: { brightness: 10 } }),
+        light("a", { color_temperature: { mirek: 370 } }),
+        light("a", { color: { xy: { x: 0.1, y: 0.2 } } }),
+      ]),
+    ).toEqual([light("a", { dimming: { brightness: 10 }, color: { xy: { x: 0.1, y: 0.2 } } })]);
+  });
+
+  test("renames, other lights and room commands keep their own requests, in order", () => {
+    const group = { kind: "grouped_light" as const, target: "g", body: { on: { on: false } } };
+    const merged = coalesce([
+      light("a", { on: { on: true } }),
+      light("a", { metadata: { name: "x" } }),
+      light("a", { dimming: { brightness: 5 } }),
+      group,
+      light("b", { on: { on: true } }),
+    ]);
+    expect(merged.map((r) => `${r.kind}:${r.target}`)).toEqual([
+      "light:a",
+      "light:a",
+      "light:a",
+      "grouped_light:g",
+      "light:b",
+    ]);
+  });
+
+  test("staging needs a transactional attach and a plaintext id", () => {
+    const id = new Uint8Array(16);
+    expect(stageable(false, id)).toBeNull();
+    expect(stageable(true, null)).toBeNull();
+    expect(stageable(true, id)).toBe(id);
+    expect(() => stageable(true, new Uint8Array(73))).toThrow(/local transports only/);
   });
 });

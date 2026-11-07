@@ -1,0 +1,170 @@
+# name: test/sql/transactions.test
+# description: Transactional attaches stage light changes and send them at COMMIT
+# group: [hue]
+
+require vgi
+
+require-env HUE_WORKER
+
+require-env HUE_MOCK_BRIDGE
+
+# Transaction ids reach functions sealed over HTTP: local transports only.
+require-env HUE_LOCAL_TRANSPORT
+
+# `bridge` shows what the bridge really holds; `tx` stages its changes.
+statement ok
+ATTACH 'hue' AS bridge (TYPE vgi, LOCATION '{HUE_WORKER}', bridge '{HUE_MOCK_BRIDGE}', app_key 'test-key');
+
+statement ok
+ATTACH 'hue' AS tx (TYPE vgi, LOCATION '{HUE_WORKER}', bridge '{HUE_MOCK_BRIDGE}', app_key 'test-key', transactional true);
+
+# A known starting point.
+statement ok
+UPDATE bridge.main.lights SET is_on = true, brightness = 50 WHERE room = 'Kitchen';
+
+statement ok
+UPDATE bridge.main.lights SET is_on = false, brightness = 30 WHERE light_id = 'l-sofa';
+
+# ------------------------------------------------------------------ COMMIT
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE tx.main.lights SET brightness = 20 WHERE room = 'Kitchen';
+
+# Inside the transaction its own pending change is visible...
+query TR
+SELECT name, brightness FROM tx.main.lights WHERE room = 'Kitchen' ORDER BY name;
+----
+Kitchen ceiling	20.0
+Kitchen pendant	20.0
+
+# ...but nothing has reached the bridge yet.
+query TR
+SELECT name, brightness FROM bridge.main.lights WHERE room = 'Kitchen' ORDER BY name;
+----
+Kitchen ceiling	50.0
+Kitchen pendant	50.0
+
+statement ok
+COMMIT;
+
+query TR
+SELECT name, brightness FROM bridge.main.lights WHERE room = 'Kitchen' ORDER BY name;
+----
+Kitchen ceiling	20.0
+Kitchen pendant	20.0
+
+# ---------------------------------------------------------------- ROLLBACK
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE tx.main.lights SET brightness = 99 WHERE room = 'Kitchen';
+
+statement ok
+ROLLBACK;
+
+query R
+SELECT max(brightness) FROM bridge.main.lights WHERE room = 'Kitchen';
+----
+20.0
+
+# ------------------------------------------------- control functions stage too
+
+statement ok
+BEGIN;
+
+query TT
+SELECT name, ok FROM tx.main.set_light('Sofa lamp', power := true, brightness := 77);
+----
+Sofa lamp	true
+
+# A staged room command has nothing to wait for yet: settled is NULL.
+query TT
+SELECT name, settled IS NULL FROM tx.main.set_room('Kitchen', brightness := 66, wait_ms := 2000);
+----
+Kitchen	true
+
+query TR
+SELECT is_on, brightness FROM bridge.main.lights WHERE light_id = 'l-sofa';
+----
+false	30.0
+
+statement ok
+COMMIT;
+
+query TR
+SELECT is_on, brightness FROM bridge.main.lights WHERE light_id = 'l-sofa';
+----
+true	77.0
+
+query R
+SELECT max(brightness) FROM bridge.main.lights WHERE room = 'Kitchen';
+----
+66.0
+
+# Several changes to one light in a transaction: the last value wins.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE tx.main.lights SET brightness = 10 WHERE light_id = 'l-sofa';
+
+statement ok
+UPDATE tx.main.lights SET brightness = 15, color_hex = '#0000ff' WHERE light_id = 'l-sofa';
+
+statement ok
+COMMIT;
+
+query RT
+SELECT brightness, color_mode FROM bridge.main.lights WHERE light_id = 'l-sofa';
+----
+15.0	xy
+
+# ------------------------------------------- a refused commit puts lights back
+
+# The white-only pendant cannot take a colour: the bridge refuses it at
+# COMMIT, after the ceiling light has changed, so the ceiling is restored.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE tx.main.lights SET brightness = 11 WHERE light_id = 'l-ceiling';
+
+statement ok
+UPDATE tx.main.lights SET color_hex = '#0000ff' WHERE light_id = 'l-pendant';
+
+statement error
+COMMIT;
+----
+COMMIT failed after 1 of 2 light changes
+
+query R
+SELECT brightness FROM bridge.main.lights WHERE light_id = 'l-ceiling';
+----
+66.0
+
+# ------------------------------------------------- statements outside BEGIN
+
+# DuckDB wraps every statement in a transaction: it applies as it commits.
+statement ok
+UPDATE tx.main.lights SET brightness = 33 WHERE light_id = 'l-sofa';
+
+query R
+SELECT brightness FROM bridge.main.lights WHERE light_id = 'l-sofa';
+----
+33.0
+
+statement error
+UPDATE tx.main.lights SET color_hex = '#00ff00' WHERE light_id = 'l-pendant';
+----
+COMMIT failed
+
+# The ordinary attach still sends at once, with per-light errors from set_lights.
+query TT
+SELECT target_id, ok FROM bridge.main.set_lights((SELECT 'l-pendant' AS light_id), color := 'blue');
+----
+l-pendant	false

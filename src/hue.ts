@@ -29,6 +29,8 @@ const USER_AGENT = `vgi-hue-worker/${VERSION}`;
 export interface BridgeOptions {
   bridge?: string | null;
   app_key?: string | null;
+  /** Stage changes in DuckDB transactions and send them at COMMIT (transactions.ts). */
+  transactional?: boolean;
 }
 
 export interface BridgeConnection {

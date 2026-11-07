@@ -24,7 +24,7 @@ import {
   type VgiFunction,
   type VgiSchema,
 } from "@query-farm/vgi";
-import { connectionFor } from "./attach.ts";
+import { connectionFor, decodeAttachOptions } from "./attach.ts";
 import {
   getResources,
   type HueDevice,
@@ -43,8 +43,10 @@ import {
   xyToHex,
 } from "./hue.ts";
 import { objectTags, resultColumns } from "./meta.ts";
+import { pendingLightBodies, stageable } from "./transactions.ts";
 
 type Columns = Record<string, unknown[]>;
+type Row = Record<string, unknown>;
 interface DoneState {
   done: boolean;
 }
@@ -140,7 +142,70 @@ function inventoryTable(config: InventoryConfig): { fn: VgiFunction; table: Tabl
 
 const conn = (params: ScanParams) => connectionFor(params.initCall.bind_call);
 
+/** The row as it reads once the bridge has applied `body` (what RETURNING and pending reads show). */
+export function applyToRow(old: Row, body: Record<string, unknown>): Row {
+  const row = { ...old };
+  const b = body as {
+    on?: { on: boolean };
+    dimming?: { brightness: number };
+    color_temperature?: { mirek: number };
+    color?: { xy: { x: number; y: number } };
+    metadata?: { name: string };
+  };
+  if (b.on) row.is_on = b.on.on;
+  if (b.dimming) row.brightness = b.dimming.brightness;
+  if (b.color_temperature) {
+    const kelvin = mirekToKelvin(b.color_temperature.mirek);
+    Object.assign(row, {
+      color_mode: "color_temperature",
+      color_temperature_kelvin: kelvin,
+      color_hex: kelvinToHex(kelvin),
+    });
+  }
+  if (b.color) {
+    const { x, y } = b.color.xy;
+    Object.assign(row, {
+      color_mode: "xy",
+      color_temperature_kelvin: null,
+      color_x: x,
+      color_y: y,
+      color_hex: xyToHex(x, y),
+    });
+  }
+  if (b.metadata) row.name = b.metadata.name;
+  return row;
+}
+
 const byId = <T extends { id: string }>(items: T[]) => new Map(items.map((i) => [i.id, i]));
+
+/**
+ * Inside a transaction of a transactional attach, show that transaction's
+ * staged light changes on top of the bridge's state (read your own writes).
+ * Staged room commands and scenes are not projected onto their lights.
+ */
+export function withPendingChanges(
+  cols: Columns,
+  bindCall: { attach_opaque_data?: Uint8Array | null; transaction_opaque_data?: Uint8Array | null },
+): Columns {
+  const txId = stageable(
+    decodeAttachOptions(bindCall.attach_opaque_data).transactional === true,
+    bindCall.transaction_opaque_data,
+  );
+  if (!txId) return cols;
+  const pending = pendingLightBodies(txId);
+  if (!pending.size) return cols;
+  const names = Object.keys(cols);
+  (cols.light_id ?? []).forEach((id, i) => {
+    const bodies = pending.get(String(id));
+    if (!bodies) return;
+    const row = bodies.reduce(
+      (acc, body) => applyToRow(acc, body),
+      Object.fromEntries(names.map((n) => [n, cols[n]?.[i] ?? null])) as Row,
+    );
+    for (const n of names) if (cols[n]) cols[n][i] = row[n] ?? null;
+  });
+  return cols;
+}
 
 // ------------------------------------------------------------------- lights()
 
@@ -257,7 +322,7 @@ export const lightsTable = inventoryTable({
       getResources<HueGroup>(c, "room"),
       getResources<HueZigbee>(c, "zigbee_connectivity"),
     ]);
-    return lightRows(lights, devices, rooms, zigbee);
+    return withPendingChanges(lightRows(lights, devices, rooms, zigbee), params.initCall.bind_call);
   },
   tags: {
     ...objectTags({

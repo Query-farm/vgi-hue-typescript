@@ -25,6 +25,7 @@ import {
   type VgiDataType,
 } from "@query-farm/vgi";
 import { connectionFor } from "./attach.ts";
+import { immediate, type Sender, senderFor } from "./dispatch.ts";
 import {
   type BridgeConnection,
   buildStateBody,
@@ -34,10 +35,8 @@ import {
   type HueLight,
   type HueScene,
   type HueZigbee,
-  hueRequest,
   type LightChange,
   lightsInGroup,
-  pace,
   reachableByDevice,
 } from "./hue.ts";
 import { objectTags, resultColumns } from "./meta.ts";
@@ -146,15 +145,19 @@ interface SetLightArgs extends StateArgs {
   light: string;
 }
 
-export async function setLight(conn: BridgeConnection, target: string, change: LightChange): Promise<ResultRow[]> {
+export async function setLight(
+  conn: BridgeConnection,
+  target: string,
+  change: LightChange,
+  send: Sender = immediate(conn),
+): Promise<ResultRow[]> {
   const body = buildStateBody(change);
   const lights = await getResources<HueLight>(conn, "light");
   const matches = matchByIdOrName(lights, target);
   if (!matches.length) throw new HueError(`no light with id or name '${target}'. Lights: ${known(lights)}`);
   const rows: ResultRow[] = [];
   for (const light of matches) {
-    await pace("light");
-    await hueRequest(conn, "PUT", `/resource/light/${light.id}`, body);
+    await send([{ kind: "light", target: light.id, body }]);
     rows.push({
       target_type: "light",
       target_id: light.id,
@@ -186,10 +189,12 @@ export const setLightFn = defineTableFunction<SetLightArgs, DoneState>({
       out.finish();
       return;
     }
+    const conn = await connectionFor(params.initCall.bind_call);
     const rows = await setLight(
-      await connectionFor(params.initCall.bind_call),
+      conn,
       params.args.light,
       changeFrom(params.args),
+      senderFor(params.initCall.bind_call, conn),
     );
     out.emit(batchFromColumns(toColumns(rows), params.outputSchema));
     state.done = true;
@@ -287,6 +292,7 @@ export async function setRoom(
   target: string,
   change: LightChange,
   waitMs: number | null = null,
+  send: Sender = immediate(conn),
 ): Promise<ResultRow[]> {
   const body = buildStateBody(change);
   const [rooms, zones] = await Promise.all([
@@ -303,9 +309,9 @@ export async function setRoom(
   const group = matches[0] as HueGroup;
   const glId = group.services?.find((s) => s.rtype === "grouped_light")?.rid;
   if (!glId) throw new HueError(`${group.type} '${group.metadata?.name}' has no grouped_light service`);
-  await pace("group");
-  await hueRequest(conn, "PUT", `/resource/grouped_light/${glId}`, body);
-  const settled = waitMs == null ? null : await waitForGroup(conn, group, body, waitMs);
+  const how = await send([{ kind: "grouped_light", target: glId, body }]);
+  // A staged change reaches the bulbs only at COMMIT: nothing to wait for yet.
+  const settled = waitMs == null || how === "staged" ? null : await waitForGroup(conn, group, body, waitMs);
   return [
     {
       target_type: group.type,
@@ -343,11 +349,13 @@ export const setRoomFn = defineTableFunction<SetRoomArgs, DoneState>({
       out.finish();
       return;
     }
+    const conn = await connectionFor(params.initCall.bind_call);
     const rows = await setRoom(
-      await connectionFor(params.initCall.bind_call),
+      conn,
       params.args.room,
       changeFrom(params.args),
       params.args.wait_ms == null ? null : Number(params.args.wait_ms),
+      senderFor(params.initCall.bind_call, conn),
     );
     out.emit(batchFromColumns(toColumns(rows), params.outputSchema));
     state.done = true;
@@ -393,7 +401,12 @@ interface RecallSceneArgs {
   room: string | null;
 }
 
-export async function recallScene(conn: BridgeConnection, target: string, room: string | null): Promise<ResultRow[]> {
+export async function recallScene(
+  conn: BridgeConnection,
+  target: string,
+  room: string | null,
+  send: Sender = immediate(conn),
+): Promise<ResultRow[]> {
   const [scenes, rooms, zones] = await Promise.all([
     getResources<HueScene>(conn, "scene"),
     getResources<HueGroup>(conn, "room"),
@@ -413,8 +426,7 @@ export async function recallScene(conn: BridgeConnection, target: string, room: 
   }
   const scene = matches[0] as HueScene;
   const body = { recall: { action: "active" } };
-  await pace("group");
-  await hueRequest(conn, "PUT", `/resource/scene/${scene.id}`, body);
+  await send([{ kind: "scene", target: scene.id, body }]);
   return [
     {
       target_type: "scene",
@@ -445,7 +457,13 @@ export const recallSceneFn = defineTableFunction<RecallSceneArgs, DoneState>({
       out.finish();
       return;
     }
-    const rows = await recallScene(await connectionFor(params.initCall.bind_call), params.args.scene, params.args.room);
+    const conn = await connectionFor(params.initCall.bind_call);
+    const rows = await recallScene(
+      conn,
+      params.args.scene,
+      params.args.room,
+      senderFor(params.initCall.bind_call, conn),
+    );
     out.emit(batchFromColumns(toColumns(rows), params.outputSchema));
     state.done = true;
   },
@@ -499,6 +517,7 @@ export const setLightsFn = defineTableInOutFunction<StateArgs, null>({
   },
   process: async (params, _state, batch, out) => {
     const conn = await connectionFor(params.initCall.bind_call);
+    const send = senderFor(params.initCall.bind_call, conn);
     const body = buildStateBody(changeFrom(params.args));
     const ids = batch.getChild("light_id");
     const nameCol = batch.getChild("name");
@@ -519,8 +538,7 @@ export const setLightsFn = defineTableInOutFunction<StateArgs, null>({
         continue;
       }
       try {
-        await pace("light");
-        await hueRequest(conn, "PUT", `/resource/light/${encodeURIComponent(id)}`, body);
+        await send([{ kind: "light", target: id, body }]);
         rows.push({
           target_type: "light",
           target_id: id,

@@ -89,7 +89,9 @@ export const CATALOG_DOC_LLM =
   "brightness, white temperature, colour and name). Changes can also be made with table functions that send " +
   "a command when the query runs and return one row per change, matching targets by id or " +
   "case-insensitive name; brightness is a percentage and white temperature is in Kelvin. They " +
-  "switch real lights in someone's home, so call them only when the user asks.";
+  "switch real lights in someone's home, so call them only when the user asks. With the ATTACH " +
+  "option `transactional true`, changes inside BEGIN ... COMMIT are staged and sent together at " +
+  "COMMIT (ROLLBACK discards them).";
 
 export const CATALOG_DOC_MD =
   "# Philips Hue for DuckDB\n\n" +

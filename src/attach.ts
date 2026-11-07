@@ -15,8 +15,9 @@
  * (see `resolveConnection` in hue.ts and discovery.ts).
  */
 
-import { type AttachOptionSpec, type CatalogAttachResult, ReadOnlyCatalogInterface, utf8 } from "@query-farm/vgi";
+import { type AttachOptionSpec, bool, type CatalogAttachResult, ReadOnlyCatalogInterface, utf8 } from "@query-farm/vgi";
 import { type BridgeConnection, type BridgeOptions, resolveConnection } from "./hue.ts";
+import { beginTransaction, commitTransaction, rollbackTransaction } from "./transactions.ts";
 
 export const ATTACH_OPTIONS: AttachOptionSpec[] = [
   {
@@ -36,6 +37,15 @@ export const ATTACH_OPTIONS: AttachOptionSpec[] = [
     type: utf8(),
     secret: true,
   },
+  {
+    name: "transactional",
+    description:
+      "Stage light changes (UPDATE and the control functions) in DuckDB transactions and send " +
+      "them at COMMIT; ROLLBACK discards them. Local transports (stdio / launch) only. Default " +
+      "false: every change is sent as its statement runs.",
+    type: bool,
+    default: false,
+  },
 ];
 
 const MAGIC = "hue1:";
@@ -49,6 +59,7 @@ export function encodeAttachOptions(options: Record<string, unknown> | undefined
     const value = options?.[key];
     if (typeof value === "string" && value.trim()) out[key] = value.trim();
   }
+  if (options?.transactional === true) out.transactional = true;
   return encoder.encode(MAGIC + JSON.stringify(out));
 }
 
@@ -79,6 +90,23 @@ export class HueCatalogInterface extends ReadOnlyCatalogInterface {
     clientCapabilities?: Uint8Array | null,
   ): Promise<CatalogAttachResult> {
     const result = await super.attach(name, options, dataVersionSpec, implementationVersion, clientCapabilities);
-    return { ...result, attach_opaque_data: encodeAttachOptions(options) };
+    return {
+      ...result,
+      attach_opaque_data: encodeAttachOptions(options),
+      // Only a transactional attach asks DuckDB for begin/commit/rollback.
+      supports_transactions: options?.transactional === true,
+    };
+  }
+
+  override transactionBegin(_attachOpaqueData: Uint8Array): Uint8Array {
+    return beginTransaction();
+  }
+
+  override async transactionCommit(attachOpaqueData: Uint8Array, transactionOpaqueData: Uint8Array): Promise<void> {
+    await commitTransaction(() => resolveConnection(decodeAttachOptions(attachOpaqueData)), transactionOpaqueData);
+  }
+
+  override transactionRollback(_attachOpaqueData: Uint8Array, transactionOpaqueData: Uint8Array): void {
+    rollbackTransaction(transactionOpaqueData);
   }
 }
