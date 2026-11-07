@@ -76,7 +76,7 @@ it; use it only on a network you trust. `LOCATION` must be an absolute path.
 | `hue.main.lights` | light: `light_id`, `name`, `room`, `is_on`, `brightness` (0–100), `color_mode`, `color_temperature_kelvin`, `color_x`/`color_y`, `color_hex`, `reachable`, `product_name`, `model_id`, `device_id` |
 | `hue.main.rooms` | room or zone: `room_id`, `name`, `kind`, `archetype`, `grouped_light_id`, `any_on`, `brightness`, `light_count`, `light_names` |
 | `hue.main.scenes` | scene: `scene_id`, `name`, `room`, `room_id`, `active` |
-| `hue.main.sensors` | sensor reading: `kind` ∈ motion / temperature / light_level / contact / device_power, with `motion`, `temperature_c`, `light_level_lux`, `contact`, `battery_percent`, `battery_state`, `reachable`, `last_changed` |
+| `hue.main.sensors` | sensor reading (none shown for a disabled sensor): `kind` ∈ motion / temperature / light_level / contact / device_power, with `motion`, `temperature_c`, `light_level_lux`, `contact`, `battery_percent`, `battery_state`, `reachable`, `last_changed` |
 
 ```sql
 -- Lights the bridge cannot reach (switched off at the wall?)
@@ -94,7 +94,7 @@ Every query reads the bridge live. Nothing is cached.
 | Function | Changes |
 |---|---|
 | `set_light(light, ...)` | one light, by id or (case-insensitive) name |
-| `set_room(room, ...)` | every light in a room or zone at once (its grouped light) |
+| `set_room(room, ..., wait_ms := NULL)` | every light in a room or zone at once (its grouped light); `wait_ms` waits until the bulbs report the change |
 | `recall_scene(scene, room := NULL)` | activates a scene, by id or name (+ room when the name repeats) |
 | `set_lights((query), ...)` | every light a query returns; the query needs a `light_id` column |
 
@@ -108,8 +108,11 @@ State arguments are named and optional; give at least one:
 | `color` | `'#rrggbb'`, `'#rgb'`, or red / orange / yellow / green / cyan / blue / purple / magenta / pink / white |
 | `transition_ms` | fade time in milliseconds |
 
-Each returns one row per change: `target_type`, `target_id`, `name`, `ok`, `error`, and the
-JSON `request` sent. Bad arguments fail at bind, before anything is sent. `set_lights` reports a
+Each returns one row per change: `target_type`, `target_id`, `name`, `ok`, `error`, the
+JSON `request` sent, and `settled`. The bridge relays a room command to each bulb over Zigbee,
+so `hue.main.lights` can show the old state for a second or two afterwards. Pass
+`wait_ms := 3000` to `set_room` to wait for the bulbs; `settled` says whether every reachable one
+reported the change in time (it is NULL when you don't wait). Bad arguments fail at bind, before anything is sent. `set_lights` reports a
 failure on one light in that light's row and carries on with the others. It also paces
 commands at about 10 per second, as Hue requires.
 

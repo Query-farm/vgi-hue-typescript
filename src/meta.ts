@@ -107,7 +107,7 @@ export const SCHEMA_DOC_LLM =
   "arguments, at least one of which is required: `power := true|false` (on/off; `on` is a SQL " +
   "keyword), `brightness := 0..100` (above 0 implies on, 0 turns off), `kelvin := 2000..6500` " +
   "or `color := '#rrggbb'` (one or the other) and `transition_ms` (fade time). Each returns " +
-  "rows of `target_type`, `target_id`, `name`, `ok`, `error`, `request`. For many lights at " +
+  "rows of `target_type`, `target_id`, `name`, `ok`, `error`, `request`, `settled`. For many lights at " +
   "once, feed a query that has a `light_id` column into the bulk function.";
 
 export const SCHEMA_DOC_MD =

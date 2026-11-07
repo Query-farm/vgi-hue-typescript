@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { Arguments, VgiClient } from "@query-farm/vgi";
 import { subprocessConnect } from "@query-farm/vgi-rpc";
 import { decodeAttachOptions, encodeAttachOptions } from "../src/attach.ts";
-import { matchByIdOrName, recallScene, setLight, setRoom } from "../src/control.ts";
+import { lightReflects, matchByIdOrName, recallScene, setLight, setRoom } from "../src/control.ts";
 import { candidateUrl, chooseBridge, discoverBridge, isBridgeId, mdnsQuery } from "../src/discovery.ts";
 import {
   type BridgeConnection,
@@ -22,7 +22,7 @@ import {
   rgbToXy,
   xyToHex,
 } from "../src/hue.ts";
-import { lightRows, roomRows } from "../src/inventory.ts";
+import { lightRows, roomRows, sensorRows } from "../src/inventory.ts";
 
 const ROOT = join(import.meta.dir, "..");
 
@@ -320,4 +320,105 @@ describe("against the mock bridge", () => {
     }
     expect(rows.map((r) => r.name)).toEqual(["Hallway", "Kitchen", "Living room", "Downstairs"]);
   });
+});
+
+/** Start the mock bridge with extra environment; resolves to its base URL. */
+async function startMock(env: Record<string, string>): Promise<{ url: string; proc: ReturnType<typeof Bun.spawn> }> {
+  const proc = Bun.spawn([process.env.PYTHON ?? "python3", join(ROOT, "test", "mock_bridge", "server.py")], {
+    stdout: "pipe",
+    stderr: "ignore",
+    env: { ...process.env, ...env },
+  });
+  const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+  let text = "";
+  while (!text.includes("\n")) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += new TextDecoder().decode(value);
+  }
+  reader.releaseLock();
+  const port = text.match(/^PORT:(\d+)/)?.[1];
+  if (!port) throw new Error(`mock bridge did not report a port: ${text}`);
+  return { url: `http://127.0.0.1:${port}`, proc };
+}
+
+describe("state after a room command", () => {
+  const light = (extra: Partial<HueLight>): HueLight => ({ id: "l", owner: { rid: "d", rtype: "device" }, ...extra });
+
+  test("on/off and brightness must match; colour only needs the colour mode", () => {
+    const on50 = light({ on: { on: true }, dimming: { brightness: 50 } });
+    expect(lightReflects(on50, { on: { on: true }, dimming: { brightness: 50.4 } })).toBe(true);
+    expect(lightReflects(on50, { on: { on: true }, dimming: { brightness: 80 } })).toBe(false);
+    expect(lightReflects(on50, { on: { on: false } })).toBe(false);
+    const xy = light({ on: { on: true }, color: { xy: { x: 0.15, y: 0.05 } }, color_temperature: { mirek: null } });
+    // A bulb clamps blue to its gamut: a different xy still counts.
+    expect(lightReflects(xy, { color: { xy: { x: 0.1355, y: 0.0399 } } })).toBe(true);
+    expect(lightReflects(xy, { color_temperature: { mirek: 370 } })).toBe(false);
+  });
+
+  test("capabilities a light lacks are not waited for, nor anything on a light turned off", () => {
+    const white = light({ on: { on: true }, dimming: { brightness: 10 } });
+    expect(lightReflects(white, { color: { xy: { x: 0.7, y: 0.3 } } })).toBe(true);
+    const off = light({ on: { on: false }, dimming: { brightness: 10 } });
+    expect(lightReflects(off, { on: { on: false }, dimming: { brightness: 100 } })).toBe(true);
+  });
+});
+
+describe("disabled sensors", () => {
+  test("show no reading and no last_changed", () => {
+    const cols = sensorRows(
+      [
+        {
+          id: "t",
+          type: "temperature",
+          owner: { rid: "d", rtype: "device" },
+          enabled: false,
+          temperature: { temperature: 30, temperature_report: { changed: "2026-10-01T00:00:00Z", temperature: 30 } },
+        },
+        {
+          id: "b",
+          type: "device_power",
+          owner: { rid: "d", rtype: "device" },
+          power_state: { battery_level: 50, battery_state: "normal" },
+        },
+      ],
+      [],
+      [],
+      [],
+    );
+    expect(cols.temperature_c).toEqual([null, null]);
+    expect(cols.last_changed).toEqual([null, null]);
+    expect(cols.battery_percent).toEqual([50, null]);
+    expect(cols.enabled).toEqual([null, false]);
+  });
+});
+
+describe("set_room wait_ms against a bridge that relays slowly", () => {
+  let mock: Awaited<ReturnType<typeof startMock>>;
+  let conn: BridgeConnection;
+
+  beforeAll(async () => {
+    mock = await startMock({ MOCK_GROUP_DELAY_MS: "700" });
+    conn = { baseUrl: mock.url, appKey: "test-key" };
+  });
+  afterAll(() => mock?.proc.kill());
+
+  const kitchen = async () =>
+    (await getResources<HueLight>(conn, "light"))
+      .filter((l) => l.id === "l-ceiling" || l.id === "l-pendant")
+      .map((l) => l.dimming?.brightness);
+
+  test("without waiting, the lights still show the old state", async () => {
+    const [row] = await setRoom(conn, "Kitchen", { brightness: 33 });
+    expect(row?.settled).toBeNull();
+    expect(await kitchen()).toEqual([80, 50]);
+  });
+
+  test("waiting long enough settles; too short a wait reports false", async () => {
+    const [slow] = await setRoom(conn, "Kitchen", { brightness: 44 }, 3000);
+    expect(slow?.settled).toBe(true);
+    expect(await kitchen()).toEqual([44, 44]);
+    const [quick] = await setRoom(conn, "Kitchen", { brightness: 55 }, 100);
+    expect(quick?.settled).toBe(false);
+  }, 15_000);
 });

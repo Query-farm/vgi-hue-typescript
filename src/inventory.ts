@@ -131,7 +131,12 @@ export const LIGHTS = resultColumns([
   ["room", utf8(), "VARCHAR", "Name of the room the light's device is in, or NULL."],
   ["archetype", utf8(), "VARCHAR", "Hue archetype, e.g. 'sultan_bulb', 'pendant_round'."],
   ["is_on", bool, "BOOLEAN", "Whether the light is on."],
-  ["brightness", float64(), "DOUBLE", "Brightness in percent (0–100); NULL for on/off-only lights."],
+  [
+    "brightness",
+    float64(),
+    "DOUBLE",
+    "Brightness in percent (0–100), the level the light has or will return to when on; an off light can report 0. NULL for on/off-only lights.",
+  ],
   ["color_mode", utf8(), "VARCHAR", "'color_temperature', 'xy', or NULL for white-only/dimmable lights."],
   ["color_temperature_kelvin", int32, "INTEGER", "Colour temperature in Kelvin when in color_temperature mode."],
   ["color_x", float64(), "DOUBLE", "CIE 1931 x chromaticity coordinate of the current colour, 0–1 (unitless)."],
@@ -240,7 +245,7 @@ export const ROOMS = resultColumns([
   ["archetype", utf8(), "VARCHAR", "Hue archetype, e.g. 'kitchen', 'living_room'."],
   ["grouped_light_id", utf8(), "VARCHAR", "Id of the grouped_light service that controls every light at once."],
   ["any_on", bool, "BOOLEAN", "Whether at least one light in the room or zone is on."],
-  ["brightness", float64(), "DOUBLE", "Average brightness of the lights that are on, in percent."],
+  ["brightness", float64(), "DOUBLE", "Average brightness of the lights that are on, in percent; 0 when all are off."],
   ["light_count", int32, "INTEGER", "Number of lights in the room or zone."],
   ["light_names", list(utf8()), "VARCHAR[]", "Names of the lights, sorted."],
 ]);
@@ -383,7 +388,12 @@ export const SENSORS = resultColumns([
   ["device_id", utf8(), "VARCHAR", "Id of the physical device; one device can carry several sensors."],
   ["device_name", utf8(), "VARCHAR", "Name of the device, e.g. 'Hallway sensor'."],
   ["room", utf8(), "VARCHAR", "Name of the room the device is in, or NULL."],
-  ["enabled", bool, "BOOLEAN", "Whether the sensor is enabled (NULL for battery readings)."],
+  [
+    "enabled",
+    bool,
+    "BOOLEAN",
+    "Whether the sensor is enabled (NULL for battery readings). A disabled sensor's reading columns and last_changed are NULL, since the bridge only holds a stale value.",
+  ],
   ["motion", bool, "BOOLEAN", "motion: whether motion is currently detected."],
   ["temperature_c", float64(), "DOUBLE", "temperature: degrees Celsius."],
   ["light_level_lux", float64(), "DOUBLE", "light_level: ambient light in lux."],
@@ -410,8 +420,11 @@ export function sensorRows(
   };
   const rows = sensors.map((s) => {
     const device = deviceById.get(s.owner.rid);
-    const level = s.light?.light_level_report?.light_level ?? s.light?.light_level;
-    const contactState = s.contact_report?.state;
+    // A disabled sensor keeps reporting its last value, which can be days old:
+    // show no reading rather than a stale one. (Battery rows have no `enabled`.)
+    const live = s.enabled !== false;
+    const level = live ? (s.light?.light_level_report?.light_level ?? s.light?.light_level) : undefined;
+    const contactState = live ? s.contact_report?.state : undefined;
     return {
       sensor_id: s.id,
       kind: s.type,
@@ -419,20 +432,23 @@ export function sensorRows(
       device_name: device?.metadata?.name ?? null,
       room: rooms.get(s.owner.rid)?.metadata?.name ?? null,
       enabled: s.enabled ?? null,
-      motion: s.motion ? (s.motion.motion_report?.motion ?? s.motion.motion ?? null) : null,
-      temperature_c: s.temperature
-        ? (s.temperature.temperature_report?.temperature ?? s.temperature.temperature ?? null)
-        : null,
+      motion: live && s.motion ? (s.motion.motion_report?.motion ?? s.motion.motion ?? null) : null,
+      temperature_c:
+        live && s.temperature
+          ? (s.temperature.temperature_report?.temperature ?? s.temperature.temperature ?? null)
+          : null,
       light_level_lux: level != null ? lightLevelToLux(level) : null,
       contact: contactState ? contactState === "contact" : null,
       battery_percent: s.power_state?.battery_level ?? null,
       battery_state: s.power_state?.battery_state ?? null,
       reachable: reachable.get(s.owner.rid) ?? null,
       last_changed: micros(
-        s.motion?.motion_report?.changed ??
-          s.temperature?.temperature_report?.changed ??
-          s.light?.light_level_report?.changed ??
-          s.contact_report?.changed,
+        !live
+          ? undefined
+          : (s.motion?.motion_report?.changed ??
+              s.temperature?.temperature_report?.changed ??
+              s.light?.light_level_report?.changed ??
+              s.contact_report?.changed),
       ),
     };
   });

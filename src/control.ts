@@ -33,9 +33,12 @@ import {
   type HueGroup,
   type HueLight,
   type HueScene,
+  type HueZigbee,
   hueRequest,
   type LightChange,
+  lightsInGroup,
   pace,
+  reachableByDevice,
   resolveConnection,
 } from "./hue.ts";
 import { objectTags, resultColumns } from "./meta.ts";
@@ -91,6 +94,12 @@ export const RESULT = resultColumns([
   ["ok", bool, "BOOLEAN", "Whether the bridge accepted the change.", false],
   ["error", utf8(), "VARCHAR", "Why the change failed, or NULL."],
   ["request", utf8(), "VARCHAR", "JSON body sent to the bridge."],
+  [
+    "settled",
+    bool,
+    "BOOLEAN",
+    "set_room with wait_ms: whether every reachable light reported the new state within wait_ms; NULL when not waited.",
+  ],
 ]);
 
 interface ResultRow {
@@ -100,6 +109,7 @@ interface ResultRow {
   ok: boolean;
   error: string | null;
   request: string | null;
+  settled: boolean | null;
 }
 
 const toColumns = (rows: ResultRow[]) =>
@@ -153,6 +163,7 @@ export async function setLight(conn: BridgeConnection, target: string, change: L
       ok: true,
       error: null,
       request: JSON.stringify(body),
+      settled: null,
     });
   }
   return rows;
@@ -220,9 +231,64 @@ export const setLightFn = defineTableFunction<SetLightArgs, DoneState>({
 
 interface SetRoomArgs extends StateArgs {
   room: string;
+  wait_ms: bigint | null;
 }
 
-export async function setRoom(conn: BridgeConnection, target: string, change: LightChange): Promise<ResultRow[]> {
+/**
+ * Whether `light` reports the state `body` asked for. On/off and brightness
+ * must match; colour and white temperature only need the matching colour mode,
+ * because a bulb clamps the requested colour to its own gamut and range. A
+ * capability the light lacks is not waited for, nor is anything on a light
+ * asked to turn off.
+ */
+export function lightReflects(light: HueLight, body: Record<string, unknown>): boolean {
+  const want = body as {
+    on?: { on: boolean };
+    dimming?: { brightness: number };
+    color_temperature?: unknown;
+    color?: unknown;
+  };
+  if (want.on && light.on && light.on.on !== want.on.on) return false;
+  if (want.on?.on === false) return true;
+  if (want.dimming && light.dimming && Math.abs(light.dimming.brightness - want.dimming.brightness) > 1.5) return false;
+  if (want.color_temperature && light.color_temperature && light.color_temperature.mirek == null) return false;
+  if (want.color && light.color && light.color_temperature?.mirek != null) return false;
+  return true;
+}
+
+export const SETTLE_POLL_MS = 250;
+export const MAX_WAIT_MS = 30_000;
+
+/**
+ * Poll until every reachable light in `group` reflects `body`, or `waitMs`
+ * passes. Room commands reach bulbs one by one over Zigbee, so a read straight
+ * after the PUT can still show the old state for a second or two.
+ */
+export async function waitForGroup(
+  conn: BridgeConnection,
+  group: HueGroup,
+  body: Record<string, unknown>,
+  waitMs: number,
+  pollMs = SETTLE_POLL_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + waitMs;
+  const zigbee = await getResources<HueZigbee>(conn, "zigbee_connectivity");
+  const reachable = reachableByDevice(zigbee);
+  for (;;) {
+    const lights = await getResources<HueLight>(conn, "light");
+    const members = lightsInGroup(group, lights).filter((l) => reachable.get(l.owner.rid) !== false);
+    if (members.every((l) => lightReflects(l, body))) return true;
+    if (Date.now() + pollMs > deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+}
+
+export async function setRoom(
+  conn: BridgeConnection,
+  target: string,
+  change: LightChange,
+  waitMs: number | null = null,
+): Promise<ResultRow[]> {
   const body = buildStateBody(change);
   const [rooms, zones] = await Promise.all([
     getResources<HueGroup>(conn, "room"),
@@ -240,6 +306,7 @@ export async function setRoom(conn: BridgeConnection, target: string, change: Li
   if (!glId) throw new HueError(`${group.type} '${group.metadata?.name}' has no grouped_light service`);
   await pace("group");
   await hueRequest(conn, "PUT", `/resource/grouped_light/${glId}`, body);
+  const settled = waitMs == null ? null : await waitForGroup(conn, group, body, waitMs);
   return [
     {
       target_type: group.type,
@@ -248,6 +315,7 @@ export async function setRoom(conn: BridgeConnection, target: string, change: Li
       ok: true,
       error: null,
       request: JSON.stringify(body),
+      settled,
     },
   ];
 }
@@ -255,10 +323,16 @@ export async function setRoom(conn: BridgeConnection, target: string, change: Li
 export const setRoomFn = defineTableFunction<SetRoomArgs, DoneState>({
   name: "set_room",
   description: "Change every light in a room or zone at once: on/off, brightness, colour temperature or colour",
-  args: { room: utf8(), ...STATE_ARG_TYPES },
-  argDefaults: STATE_DEFAULTS,
-  argDocs: { room: "Room or zone id or name (case-insensitive), as listed by rooms.", ...STATE_DOCS },
-  argConstraints: STATE_CONSTRAINTS,
+  args: { room: utf8(), ...STATE_ARG_TYPES, wait_ms: int64() },
+  argDefaults: { ...STATE_DEFAULTS, wait_ms: null },
+  argDocs: {
+    room: "Room or zone id or name (case-insensitive), as listed by rooms.",
+    ...STATE_DOCS,
+    wait_ms:
+      "Named, optional: wait up to this many milliseconds (max 30000) until every reachable light " +
+      "reports the new state, and say whether it did in the `settled` column. NULL returns at once.",
+  },
+  argConstraints: { ...STATE_CONSTRAINTS, wait_ms: { ge: 0, le: MAX_WAIT_MS } },
   stability: FunctionStability.VOLATILE,
   onBind: (params) => {
     buildStateBody(changeFrom(params.args));
@@ -274,6 +348,7 @@ export const setRoomFn = defineTableFunction<SetRoomArgs, DoneState>({
       await connectionFor(params.initCall.bind_call),
       params.args.room,
       changeFrom(params.args),
+      params.args.wait_ms == null ? null : Number(params.args.wait_ms),
     );
     out.emit(batchFromColumns(toColumns(rows), params.outputSchema));
     state.done = true;
@@ -289,10 +364,14 @@ export const setRoomFn = defineTableFunction<SetRoomArgs, DoneState>({
         "`rooms`. Named optional state arguments, at least one required: `power := true|false`, " +
         "`brightness := 0..100`, `kelvin := 2000..6500` or `color := '#rrggbb'`, `transition_ms`. " +
         "Returns one row (`target_type` 'room' or 'zone', `target_id`, `name`, `ok`, `error`, " +
-        "`request`). Changes real lights: call it only when the user asks for it.",
+        "`request`, `settled`). The bridge relays a room command to each bulb over Zigbee, so the " +
+        "lights table can show the old state for a second or two afterwards; pass `wait_ms := 3000` " +
+        "to wait until every reachable light reports the change (`settled` says whether it did). " +
+        "Changes real lights: call it only when the user asks for it.",
       docMd:
-        "## set_room(room, power :=, brightness :=, kelvin :=, color :=, transition_ms :=)\n\n" +
-        "Change every light in a room or zone at once.",
+        "## set_room(room, power :=, brightness :=, kelvin :=, color :=, transition_ms :=, wait_ms :=)\n\n" +
+        "Change every light in a room or zone at once. The bulbs pick the change up over a second " +
+        "or two; `wait_ms` waits for them and reports it in `settled`.",
     }),
     "vgi.result_columns_schema": RESULT.tag,
   },
@@ -345,6 +424,7 @@ export async function recallScene(conn: BridgeConnection, target: string, room: 
       ok: true,
       error: null,
       request: JSON.stringify(body),
+      settled: null,
     },
   ];
 }
@@ -439,13 +519,29 @@ export const setLightsFn = defineTableInOutFunction<StateArgs, AttachedOptions>(
       const id = ids?.get(i) as string | null;
       const name = (nameCol?.get(i) as string | null | undefined) ?? null;
       if (id == null) {
-        rows.push({ target_type: "light", target_id: "", name, ok: false, error: "light_id is NULL", request: null });
+        rows.push({
+          target_type: "light",
+          target_id: "",
+          name,
+          ok: false,
+          error: "light_id is NULL",
+          request: null,
+          settled: null,
+        });
         continue;
       }
       try {
         await pace("light");
         await hueRequest(conn, "PUT", `/resource/light/${encodeURIComponent(id)}`, body);
-        rows.push({ target_type: "light", target_id: id, name, ok: true, error: null, request: JSON.stringify(body) });
+        rows.push({
+          target_type: "light",
+          target_id: id,
+          name,
+          ok: true,
+          error: null,
+          request: JSON.stringify(body),
+          settled: null,
+        });
       } catch (err) {
         rows.push({
           target_type: "light",
@@ -454,6 +550,7 @@ export const setLightsFn = defineTableInOutFunction<StateArgs, AttachedOptions>(
           ok: false,
           error: (err as Error).message,
           request: JSON.stringify(body),
+          settled: null,
         });
       }
     }

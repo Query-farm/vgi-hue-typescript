@@ -9,7 +9,10 @@ Home layout
 -----------
 * Kitchen:     "Kitchen ceiling" (white ambiance, on), "Kitchen pendant"
                (dimmable white only, on), "Kitchen sensor" (motion sensor)
-* Living room: "Sofa lamp" (colour, off), "Desk lamp" (colour, on, unreachable)
+* Living room: "Sofa lamp" (colour, off), "Desk lamp" (colour, on, unreachable),
+               "Living room sensor" (motion sensor, disabled: its readings are
+               stale, as a real bridge keeps them), "Hue tap dial switch"
+               (battery only; its buttons are not read)
 * Hallway:     "Hallway sensor" (motion sensor), "Front door" (contact sensor)
 * Zone "Downstairs": Kitchen ceiling + Sofa lamp
 * Scenes: Relax (Kitchen), Bright (Kitchen), Relax (Living room)
@@ -23,6 +26,8 @@ mock; ``/discovery/none`` lists nothing).
 Switches (environment):
 * ``MOCK_APP_KEY`` (default ``test-key``): required ``hue-application-key``.
 * ``MOCK_FLAKY=1``: the first GET of every path answers 429 + Retry-After: 0.
+* ``MOCK_GROUP_DELAY_MS``: apply grouped_light commands to the bulbs only after
+  this delay, as a real bridge relays them over Zigbee one bulb at a time.
 
 Usage: ``python3 test/mock_bridge/server.py`` prints ``PORT:<n>`` once listening.
 """
@@ -72,14 +77,16 @@ def light(lid: str, did: str, name: str, on: bool, bri: float, mirek: int | None
     return out
 
 
-def sensor_services(did: str, prefix: str, motion: bool, temp: float, level: int, battery: int, state: str, changed: str) -> list[dict]:
+def sensor_services(
+    did: str, prefix: str, motion: bool, temp: float, level: int, battery: int, state: str, changed: str, enabled: bool = True
+) -> list[dict]:
     return [
-        {"id": f"{prefix}-motion", "type": "motion", "owner": ref(did, "device"), "enabled": True,
+        {"id": f"{prefix}-motion", "type": "motion", "owner": ref(did, "device"), "enabled": enabled,
          "motion": {"motion": motion, "motion_valid": True, "motion_report": {"changed": changed, "motion": motion}}},
-        {"id": f"{prefix}-temp", "type": "temperature", "owner": ref(did, "device"), "enabled": True,
+        {"id": f"{prefix}-temp", "type": "temperature", "owner": ref(did, "device"), "enabled": enabled,
          "temperature": {"temperature": temp, "temperature_valid": True,
                          "temperature_report": {"changed": changed, "temperature": temp}}},
-        {"id": f"{prefix}-light", "type": "light_level", "owner": ref(did, "device"), "enabled": True,
+        {"id": f"{prefix}-light", "type": "light_level", "owner": ref(did, "device"), "enabled": enabled,
          "light": {"light_level": level, "light_level_valid": True,
                    "light_level_report": {"changed": changed, "light_level": level}}},
         {"id": f"{prefix}-power", "type": "device_power", "owner": ref(did, "device"),
@@ -96,6 +103,8 @@ def initial_state() -> dict[str, list[dict]]:
         device("d-ksensor", "Kitchen sensor", "SML001", "Hue motion sensor", []),
         device("d-hsensor", "Hallway sensor", "SML001", "Hue motion sensor", []),
         device("d-door", "Front door", "SOC001", "Hue secure contact sensor", []),
+        device("d-lsensor", "Living room sensor", "SML001", "Hue motion sensor", []),
+        device("d-dial", "Hue tap dial switch", "RDM002", "Hue tap dial switch", [ref("dial-button-1", "button")]),
     ]
     lights = [
         light("l-ceiling", "d-ceiling", "Kitchen ceiling", True, 80.0, 370, None, "ceiling_round"),
@@ -110,7 +119,7 @@ def initial_state() -> dict[str, list[dict]]:
          "children": [ref("d-ceiling", "device"), ref("d-pendant", "device"), ref("d-ksensor", "device")],
          "services": [ref("gl-kitchen", "grouped_light")]},
         {"id": "r-living", "type": "room", "metadata": {"name": "Living room", "archetype": "living_room"},
-         "children": [ref("d-sofa", "device"), ref("d-desk", "device")],
+         "children": [ref("d-sofa", "device"), ref("d-desk", "device"), ref("d-lsensor", "device"), ref("d-dial", "device")],
          "services": [ref("gl-living", "grouped_light")]},
         {"id": "r-hallway", "type": "room", "metadata": {"name": "Hallway", "archetype": "hallway"},
          "children": [ref("d-hsensor", "device"), ref("d-door", "device")],
@@ -136,7 +145,13 @@ def initial_state() -> dict[str, list[dict]]:
     sensors = (
         sensor_services("d-ksensor", "ks", False, 23.25, 1, 80, "normal", "2026-11-01T08:30:00.000Z")
         + sensor_services("d-hsensor", "hs", True, 19.5, 20001, 15, "low", "2026-11-01T10:00:00.000Z")
+        # Disabled: a real bridge keeps the last (stale) values, here hot, bright and moving.
+        + sensor_services("d-lsensor", "ls", True, 30.0, 30001, 100, "normal", "2026-10-01T12:00:00.000Z", enabled=False)
     )
+    dial = [
+        {"id": "dial-power", "type": "device_power", "owner": ref("d-dial", "device"),
+         "power_state": {"battery_state": "normal", "battery_level": 74}},
+    ]
     contact = [
         {"id": "door-contact", "type": "contact", "owner": ref("d-door", "device"), "enabled": True,
          "contact_report": {"changed": "2026-11-01T09:15:00.000Z", "state": "no_contact"}},
@@ -152,14 +167,14 @@ def initial_state() -> dict[str, list[dict]]:
         "device": devices, "light": lights, "room": rooms, "zone": zones, "scene": scenes,
         "zigbee_connectivity": zigbee, "contact": [c for c in contact if c["type"] == "contact"],
     }
-    for s in sensors + contact:
+    for s in sensors + contact + dial:
         if s["type"] != "contact":
             by_type.setdefault(s["type"], []).append(s)
     return by_type
 
 
 STATE = initial_state()
-LOCK = threading.Lock()
+LOCK = threading.RLock()  # re-entrant: delayed group commands take it too
 _flaky_seen: set[str] = set()
 
 
@@ -292,9 +307,17 @@ class Handler(BaseHTTPRequestHandler):
                 if group is None:
                     self._error(404, "Not Found")
                     return
-                for l in group_lights(group):
-                    # A group command skips capabilities a member lacks, as the bridge does.
-                    apply_light(l, {k: v for k, v in body.items() if k not in ("color", "color_temperature") or k in l})
+                def apply_group(members: list[dict] = group_lights(group), body: dict = body) -> None:
+                    with LOCK:
+                        for l in members:
+                            # A group command skips capabilities a member lacks, as the bridge does.
+                            apply_light(l, {k: v for k, v in body.items() if k not in ("color", "color_temperature") or k in l})
+
+                delay_ms = int(os.environ.get("MOCK_GROUP_DELAY_MS") or 0)
+                if delay_ms:
+                    threading.Timer(delay_ms / 1000, apply_group).start()
+                else:
+                    apply_group()
             elif rtype == "scene":
                 scene = find("scene", rid)
                 if scene is None:

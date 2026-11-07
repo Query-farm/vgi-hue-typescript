@@ -71,28 +71,43 @@ device_power	Hallway sensor	Hallway	NULL	NULL	NULL	NULL	15	low
 light_level	Hallway sensor	Hallway	NULL	NULL	100.0	NULL	NULL	NULL
 motion	Hallway sensor	Hallway	true	NULL	NULL	NULL	NULL	NULL
 temperature	Hallway sensor	Hallway	NULL	19.5	NULL	NULL	NULL	NULL
+device_power	Hue tap dial switch	Living room	NULL	NULL	NULL	NULL	74	normal
 device_power	Kitchen sensor	Kitchen	NULL	NULL	NULL	NULL	80	normal
 light_level	Kitchen sensor	Kitchen	NULL	NULL	1.0	NULL	NULL	NULL
 motion	Kitchen sensor	Kitchen	false	NULL	NULL	NULL	NULL	NULL
 temperature	Kitchen sensor	Kitchen	NULL	23.25	NULL	NULL	NULL	NULL
+device_power	Living room sensor	Living room	NULL	NULL	NULL	NULL	100	normal
+light_level	Living room sensor	Living room	NULL	NULL	NULL	NULL	NULL	NULL
+motion	Living room sensor	Living room	NULL	NULL	NULL	NULL	NULL	NULL
+temperature	Living room sensor	Living room	NULL	NULL	NULL	NULL	NULL	NULL
+
+# A disabled sensor: enabled is false and its stale readings (30 °C, 1000 lux,
+# motion) are not shown, nor when they last changed.
+query TTT
+SELECT kind, enabled, last_changed IS NULL FROM hue.main.sensors WHERE device_name = 'Living room sensor' AND kind <> 'device_power' ORDER BY kind;
+----
+light_level	false	true
+motion	false	true
+temperature	false	true
 
 query T
 SELECT epoch(last_changed)::BIGINT FROM hue.main.sensors WHERE kind = 'motion' AND device_name = 'Hallway sensor';
 ----
 1793527200
 
+# Kitchen, not the disabled Living room sensor's stale 30 °C.
 query T
-SELECT room FROM hue.main.sensors WHERE kind = 'temperature' ORDER BY temperature_c DESC LIMIT 1;
+SELECT room FROM hue.main.sensors WHERE kind = 'temperature' ORDER BY temperature_c DESC NULLS LAST LIMIT 1;
 ----
 Kitchen
 
 # --------------------------------------------------------------- set_light()
 
 # Names match case-insensitively; brightness above 0 implies on.
-query TTTTTT
+query TTTTTTT
 SELECT * FROM hue.main.set_light('sofa lamp', brightness := 60, color := 'red');
 ----
-light	l-sofa	Sofa lamp	true	NULL	{"dimming":{"brightness":60},"on":{"on":true},"color":{"xy":{"x":0.7006,"y":0.2993}}}
+light	l-sofa	Sofa lamp	true	NULL	{"dimming":{"brightness":60},"on":{"on":true},"color":{"xy":{"x":0.7006,"y":0.2993}}}	NULL
 
 query TRTRR
 SELECT is_on, brightness, color_mode, color_x, color_y FROM hue.main.lights WHERE light_id = 'l-sofa';
@@ -182,6 +197,24 @@ SELECT name, is_on, brightness FROM hue.main.lights WHERE name IN ('Kitchen ceil
 Kitchen ceiling	true	25.0
 Sofa lamp	true	25.0
 
+# wait_ms re-reads the lights until they all report the change; `settled`
+# says whether they did (the mock applies room commands at once). The
+# unreachable Desk lamp is not waited for.
+query TTT
+SELECT name, settled, request FROM hue.main.set_room('Living room', brightness := 70, wait_ms := 2000);
+----
+Living room	true	{"dimming":{"brightness":70},"on":{"on":true}}
+
+query I
+SELECT settled IS NULL FROM hue.main.set_room('Living room', brightness := 25);
+----
+true
+
+statement error
+SELECT * FROM hue.main.set_room('Living room', power := true, wait_ms := 60000);
+----
+<REGEX>:.*
+
 statement error
 SELECT * FROM hue.main.set_room('Attic', power := true);
 ----
@@ -241,7 +274,7 @@ Sofa lamp	3003
 query I
 SELECT count(*) FILTER (WHERE ok) FROM hue.main.set_lights((SELECT light_id FROM hue.main.lights WHERE is_on), power := false);
 ----
-2
+3
 
 query I
 SELECT count(*) FROM hue.main.lights WHERE is_on;
