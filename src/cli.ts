@@ -108,8 +108,6 @@ export function serve(
   const registry = new FunctionRegistry();
   for (const schema of catalog.schemas) {
     for (const fn of schema.functions ?? []) registry.register(fn);
-    // Tables are served by scan functions that are not listed in `functions`.
-    for (const table of schema.tables ?? []) if (table.function) registry.register(table.function);
   }
   // Adds the `bridge` / `app_key` ATTACH options to the descriptor catalog.
   const catalogInterface = new HueCatalogInterface(catalog, registry);

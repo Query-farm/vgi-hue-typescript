@@ -15,14 +15,7 @@
  * (see `resolveConnection` in hue.ts and discovery.ts).
  */
 
-import {
-  type AttachOptionSpec,
-  type CatalogAttachResult,
-  type CatalogInfo,
-  ReadOnlyCatalogInterface,
-  serializeAttachOptionSpecs,
-  utf8,
-} from "@query-farm/vgi";
+import { type AttachOptionSpec, type CatalogAttachResult, ReadOnlyCatalogInterface, utf8 } from "@query-farm/vgi";
 import { type BridgeConnection, type BridgeOptions, resolveConnection } from "./hue.ts";
 
 export const ATTACH_OPTIONS: AttachOptionSpec[] = [
@@ -78,17 +71,6 @@ export function connectionFor(bindCall: { attach_opaque_data?: Uint8Array | null
 
 /** The descriptor catalog plus the `bridge` / `app_key` ATTACH options. */
 export class HueCatalogInterface extends ReadOnlyCatalogInterface {
-  override attachOptionSpecs(_name: string): AttachOptionSpec[] {
-    return ATTACH_OPTIONS;
-  }
-
-  override catalogsInfo(): CatalogInfo[] {
-    return super.catalogsInfo().map((info) => ({
-      ...info,
-      attach_option_specs: serializeAttachOptionSpecs(ATTACH_OPTIONS),
-    }));
-  }
-
   override async attach(
     name: string,
     options?: Record<string, unknown>,

@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@query-farm/apache-arrow": "^21.1.1",
-    "@query-farm/vgi": "~0.48.1",
+    "@query-farm/vgi": "file:.vendor/query-farm-vgi-0.48.2.tgz",
     "@query-farm/vgi-rpc": "^0.29.6"
   },
   "devDependencies": {

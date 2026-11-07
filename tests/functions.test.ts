@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Arguments, VgiClient } from "@query-farm/vgi";
+import { Arguments, batchFromColumns, bool, field, float64, int64, schema, utf8, VgiClient } from "@query-farm/vgi";
 import { subprocessConnect } from "@query-farm/vgi-rpc";
 import { decodeAttachOptions, encodeAttachOptions } from "../src/attach.ts";
 import { lightReflects, matchByIdOrName, recallScene, setLight, setRoom } from "../src/control.ts";
@@ -22,7 +22,8 @@ import {
   rgbToXy,
   xyToHex,
 } from "../src/hue.ts";
-import { lightRows, roomRows, sensorRows } from "../src/inventory.ts";
+import { lightRowId, lightRows, roomRows, sensorRows } from "../src/inventory.ts";
+import { applyToRow, checkKnownColumns, rowChange, updateBody } from "../src/lights_write.ts";
 
 const ROOT = join(import.meta.dir, "..");
 
@@ -421,4 +422,77 @@ describe("set_room wait_ms against a bridge that relays slowly", () => {
     const [quick] = await setRoom(conn, "Kitchen", { brightness: 55 }, 100);
     expect(quick?.settled).toBe(false);
   }, 15_000);
+});
+
+describe("UPDATE hue.main.lights", () => {
+  test("rowids are stable, positive, and distinct", () => {
+    const id = "5b859859-7f0d-460f-a587-28de40e03404";
+    expect(lightRowId(id)).toBe(lightRowId(id));
+    expect(lightRowId(id) > 0n && lightRowId(id) < 2n ** 62n).toBe(true);
+    const ids = Array.from({ length: 2000 }, (_, i) => `light-${i}`);
+    expect(new Set(ids.map(lightRowId)).size).toBe(ids.length);
+  });
+
+  const current = {
+    light_id: "l",
+    name: "Lamp",
+    room: "Den",
+    is_on: false,
+    brightness: 30,
+    color_mode: "color_temperature",
+    color_temperature_kelvin: 4000,
+    color_hex: "#ffcea6",
+  };
+  // DuckDB's input to the update function: changed columns (or all, with RETURNING) + rowid.
+  const input = (cols: Record<string, unknown>) =>
+    batchFromColumns(
+      { ...Object.fromEntries(Object.entries(cols).map(([k, v]) => [k, [v]])), rowid: [1n] },
+      schema([
+        ...Object.keys(cols).map((k) =>
+          field(
+            k,
+            k === "is_on" ? bool : k === "brightness" ? float64() : k.endsWith("kelvin") ? int64() : utf8(),
+            true,
+          ),
+        ),
+        field("rowid", int64(), false),
+      ]),
+    );
+
+  test("only values that differ from the light's current row are changes", () => {
+    // RETURNING passes every column: unchanged ones (colour, kelvin, room) are ignored.
+    const { change, name } = rowChange(
+      input({
+        name: "Lamp",
+        room: "Den",
+        is_on: true,
+        brightness: 30,
+        color_temperature_kelvin: 4000n,
+        color_hex: "#FFCEA6",
+      }),
+      0,
+      current,
+    );
+    expect(change).toEqual({ on: true });
+    expect(name).toBeNull();
+  });
+
+  test("a changed read-only column is refused; NULL and bad names too", () => {
+    expect(() => rowChange(input({ room: "Attic" }), 0, current)).toThrow(/cannot UPDATE 'room'/);
+    expect(() => rowChange(input({ brightness: null }), 0, current)).toThrow(/NULL/);
+    expect(() => rowChange(input({ name: "x".repeat(33) }), 0, current)).toThrow(/1-32/);
+    expect(() => checkKnownColumns(["nope", "rowid"])).toThrow(/no column 'nope'/);
+  });
+
+  test("the PUT body and the row RETURNING shows", () => {
+    expect(updateBody({}, "Reading")).toEqual({ metadata: { name: "Reading" } });
+    const body = updateBody({ kelvin: 2700 }, null);
+    expect(body).toEqual({ color_temperature: { mirek: 370 } });
+    expect(applyToRow(current, body)).toMatchObject({
+      color_temperature_kelvin: 2703,
+      color_mode: "color_temperature",
+    });
+    const red = applyToRow(current, updateBody({ color: "red", on: true }, null));
+    expect(red).toMatchObject({ is_on: true, color_mode: "xy", color_temperature_kelvin: null, color_hex: "#ff0000" });
+  });
 });

@@ -6,15 +6,29 @@
  */
 
 import type { CatalogDescriptor, VgiFunction } from "@query-farm/vgi";
+import { ATTACH_OPTIONS } from "./attach.ts";
 import { recallSceneFn, setLightFn, setLightsFn, setRoomFn } from "./control.ts";
 import { lightsTable, roomsTable, scenesTable, sensorsTable } from "./inventory.ts";
+import { lightsUpdateFn } from "./lights_write.ts";
 import { CATALOG_DOC_MD, CATALOG_NAME, CATALOG_TAGS, SCHEMA_DOC_MD, SCHEMA_TAGS, SOURCE_URL } from "./meta.ts";
 
 /** Read-only inventory, exposed as tables: SELECT * FROM hue.main.lights. */
-export const TABLES = [lightsTable, roomsTable, scenesTable, sensorsTable].map((t) => t.table);
+export const TABLES = [
+  // lights also accepts UPDATE (lights_write.ts), up to old/new `changes` results.
+  { ...lightsTable.table, updateFunction: lightsUpdateFn, writeResultModes: { update: "changes" as const } },
+  ...[roomsTable, scenesTable, sensorsTable].map((t) => t.table),
+];
 
 /** Control functions. */
-export const FUNCTIONS: VgiFunction[] = [setLightFn, setRoomFn, recallSceneFn, setLightsFn];
+export const FUNCTIONS: VgiFunction[] = [
+  // Listed so DuckDB knows the lights scan supports projection pushdown, which
+  // the rowid virtual column (and so UPDATE) requires.
+  lightsTable.fn,
+  setLightFn,
+  setRoomFn,
+  recallSceneFn,
+  setLightsFn,
+];
 
 interface Example {
   description: string;
@@ -52,6 +66,7 @@ export const CATALOG: CatalogDescriptor = {
   comment: CATALOG_DOC_MD,
   sourceUrl: SOURCE_URL,
   tags: CATALOG_TAGS,
+  attachOptions: ATTACH_OPTIONS,
   schemas: [
     {
       path: ["main"],

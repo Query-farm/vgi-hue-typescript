@@ -85,7 +85,8 @@ export const CATALOG_DOC_LLM =
   "devices are placed in a room; a zone is any grouping of individual lights; a scene is a " +
   "saved lighting state for one room or zone; a sensor is a service on a device (a Hue motion " +
   "sensor also reports temperature, ambient light and battery). Inventory is exposed as " +
-  "tables that always read live bridge state. Changes are made with table functions that send " +
+  "tables that always read live bridge state; the lights table also accepts UPDATE (power, " +
+  "brightness, white temperature, colour and name). Changes can also be made with table functions that send " +
   "a command when the query runs and return one row per change, matching targets by id or " +
   "case-insensitive name; brightness is a percentage and white temperature is in Kelvin. They " +
   "switch real lights in someone's home, so call them only when the user asks.";
@@ -103,6 +104,8 @@ export const CATALOG_DOC_MD =
 export const SCHEMA_DOC_LLM =
   "Everything for the attached Hue bridge lives in `main`. The inventory tables take no " +
   "arguments and reflect the bridge at query time; filter and join them like any table. The " +
+  "lights table also accepts UPDATE of `is_on`, `brightness`, `color_temperature_kelvin`, " +
+  "`color_hex` and `name`. The " +
   "control functions take a target (id or case-insensitive name) plus named, optional state " +
   "arguments, at least one of which is required: `power := true|false` (on/off; `on` is a SQL " +
   "keyword), `brightness := 0..100` (above 0 implies on, 0 turns off), `kelvin := 2000..6500` " +
@@ -127,6 +130,7 @@ export const AGENT_TEST_TASKS = [
   },
   { name: "kitchen_off", prompt: "Using the hue worker, turn off all the lights in the Kitchen." },
   { name: "dim_sofa", prompt: "Using the hue worker, set the Sofa lamp to 30% brightness." },
+  { name: "rename_desk_lamp", prompt: "Using the hue worker, rename the light called Desk lamp to Reading lamp." },
   {
     name: "relax_living_room",
     prompt: "Using the hue worker, activate the Relax scene in the Living room.",

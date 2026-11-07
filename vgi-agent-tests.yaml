@@ -20,6 +20,8 @@ tasks:
     reference_sql: SELECT target_type, name, ok FROM hue.main.set_room('Kitchen', power := false)
   - name: dim_sofa
     reference_sql: SELECT name, ok FROM hue.main.set_light('Sofa lamp', brightness := 30)
+  - name: rename_desk_lamp
+    check_sql: SELECT count(*) = 1 FROM hue.main.lights WHERE name = 'Reading lamp'
   - name: relax_living_room
     reference_sql: SELECT name, ok FROM hue.main.recall_scene('Relax', room := 'Living room')
   - name: warm_white_everywhere

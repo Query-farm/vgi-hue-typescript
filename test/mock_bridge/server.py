@@ -205,6 +205,11 @@ def apply_light(l: dict, body: dict) -> str | None:
         return f"device ({l['metadata']['name']}) does not support color"
     if "color_temperature" in body and "color_temperature" not in l:
         return f"device ({l['metadata']['name']}) does not support color_temperature"
+    if "metadata" in body and "name" in body["metadata"]:
+        name = str(body["metadata"]["name"])
+        if not 1 <= len(name) <= 32:
+            return "metadata.name must be 1-32 characters"
+        l["metadata"]["name"] = name
     if "on" in body:
         l["on"]["on"] = bool(body["on"]["on"])
     if "dimming" in body:

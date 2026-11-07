@@ -89,7 +89,31 @@ SELECT device_name, battery_percent FROM hue.main.sensors WHERE kind = 'device_p
 
 Every query reads the bridge live. Nothing is cached.
 
-## Controlling
+## Changing lights with UPDATE
+
+The `lights` table is writable. `WHERE` picks the lights; `SET` says what to change:
+
+```sql
+UPDATE hue.main.lights SET is_on = true, brightness = 40 WHERE room = 'Kitchen';
+UPDATE hue.main.lights SET color_hex = '#ff8000' WHERE name LIKE 'Signe%' RETURNING name, color_hex;
+UPDATE hue.main.lights SET color_temperature_kelvin = 2700 WHERE color_mode IS NOT NULL;
+UPDATE hue.main.lights SET name = 'Reading lamp' WHERE name = 'Desk lamp';
+```
+
+| Updatable column | Values |
+|---|---|
+| `is_on` | `true` / `false` |
+| `brightness` | 0–100 (above 0 turns the light on unless `is_on` says otherwise; 0 turns it off) |
+| `color_temperature_kelvin` | 2000–6500 |
+| `color_hex` | `'#rrggbb'`, `'#rgb'` or a basic colour name |
+| `name` | 1–32 characters; renames the light on the bridge |
+
+Every other column belongs to the bridge or the device, and changing it is refused before
+anything is sent. Each light gets one command, paced at about 10 per second. `RETURNING` shows
+the rows as written. Each light has a stable `rowid`, a hash of its id, which is how DuckDB
+tells the worker which lights matched.
+
+## Controlling with functions
 
 | Function | Changes |
 |---|---|
@@ -138,6 +162,7 @@ src/
   hue.ts         # CLIP v2 client (retries, pacing), colour math, request bodies
   inventory.ts   # lights / rooms / scenes / sensors tables
   control.ts     # set_light / set_room / recall_scene / set_lights
+  lights_write.ts # UPDATE hue.main.lights (rowid -> light, SET -> one PUT per light)
   catalog.ts     # assembles the catalog
   meta.ts        # catalog/schema metadata and helpers
 test/mock_bridge/server.py   # stateful offline mock of a Hue bridge

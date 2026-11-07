@@ -24,7 +24,7 @@ import {
   utf8,
   type VgiDataType,
 } from "@query-farm/vgi";
-import { connectionFor, decodeAttachOptions } from "./attach.ts";
+import { connectionFor } from "./attach.ts";
 import {
   type BridgeConnection,
   buildStateBody,
@@ -39,7 +39,6 @@ import {
   lightsInGroup,
   pace,
   reachableByDevice,
-  resolveConnection,
 } from "./hue.ts";
 import { objectTags, resultColumns } from "./meta.ts";
 
@@ -475,18 +474,17 @@ export const recallSceneFn = defineTableFunction<RecallSceneArgs, DoneState>({
 
 // ----------------------------------------------------------------- set_lights
 
-/** set_lights' stream state: the ATTACH options, '' when not given. */
-interface AttachedOptions {
-  bridge: string;
-  app_key: string;
-}
-
-export const setLightsFn = defineTableInOutFunction<StateArgs, AttachedOptions>({
+export const setLightsFn = defineTableInOutFunction<StateArgs, null>({
   name: "set_lights",
   description: "Apply one change to every light listed by a query (its light_id column)",
   namedArgs: STATE_ARG_TYPES,
   argDefaults: STATE_DEFAULTS,
-  argDocs: STATE_DOCS,
+  argDocs: {
+    ...STATE_DOCS,
+    data:
+      "Input query: one row per light to change, with a `light_id` column (from hue.main.lights) " +
+      "and optionally a `name` column that is echoed back.",
+  },
   argConstraints: STATE_CONSTRAINTS,
   stability: FunctionStability.VOLATILE,
   onBind: (params) => {
@@ -499,18 +497,8 @@ export const setLightsFn = defineTableInOutFunction<StateArgs, AttachedOptions>(
     buildStateBody(changeFrom(params.args));
     return { outputSchema: RESULT.schema };
   },
-  // Capture the ATTACH options on the init turn. Over HTTP, later exchange
-  // turns see attach_opaque_data still sealed (SDK 0.48.1) and call
-  // initialState again before restoring the saved state, so this must not
-  // throw; the saved options ride in the stream state, which the SDK carries
-  // in an AEAD-encrypted, caller-bound token (and never stores, as set_lights
-  // has no finalize).
-  initialState: (params): AttachedOptions => {
-    const opts = decodeAttachOptions(params.initCall.bind_call.attach_opaque_data);
-    return { bridge: opts.bridge ?? "", app_key: opts.app_key ?? "" };
-  },
-  process: async (params, opts, batch, out) => {
-    const conn = await resolveConnection(opts);
+  process: async (params, _state, batch, out) => {
+    const conn = await connectionFor(params.initCall.bind_call);
     const body = buildStateBody(changeFrom(params.args));
     const ids = batch.getChild("light_id");
     const nameCol = batch.getChild("name");
@@ -591,13 +579,3 @@ export const setLightsFn = defineTableInOutFunction<StateArgs, AttachedOptions>(
     },
   ],
 });
-
-// The SDK adds the TABLE argument ("data") without a description; document it
-// so `vgi_function_arguments()` explains what the input query must contain.
-for (const spec of setLightsFn.argumentSpecs) {
-  if (spec.isTableInput) {
-    spec.doc =
-      "Input query: one row per light to change, with a `light_id` column (from hue.main.lights) " +
-      "and optionally a `name` column that is echoed back.";
-  }
-}

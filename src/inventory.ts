@@ -1,5 +1,6 @@
 /**
- * Read-only inventory tables: lights, rooms, scenes, sensors.
+ * Inventory tables: lights, rooms, scenes, sensors. `lights` also accepts
+ * UPDATE (see lights_write.ts); the others are read-only.
  *
  * Each call fetches the bridge resources it needs (in parallel), joins them
  * into rows, and emits one batch: a home has at most a few hundred lights, so
@@ -14,6 +15,8 @@ import {
   float64,
   int32,
   list,
+  rowIdField,
+  schema,
   type TableDescriptor,
   type TableProcessParams,
   timestampMicros,
@@ -59,6 +62,16 @@ interface InventoryConfig {
   primaryKey: string;
   /** Columns the bridge always fills, besides the key; declared NOT NULL. */
   notNull: string[];
+  /**
+   * Give the table a `rowid` column so it can accept UPDATE/DELETE. `load`
+   * must then fill `rowid`. DuckDB reads it as a virtual column, which needs
+   * a scan with projection pushdown that is listed in the schema's functions,
+   * so the scan is built that way (see `scanTags`).
+   */
+  rowId?: boolean;
+  /** Discovery metadata for the listed scan function (required with `rowId`). */
+  scanTags?: Record<string, string>;
+  scanExamples?: { sql: string; description: string }[];
   /** Examples that run without a bridge (they only read the table's shape). */
   executableExamples?: { description: string; sql: string; expected_result: Record<string, string>[] }[];
 }
@@ -68,10 +81,16 @@ interface InventoryConfig {
  * The scan function is not listed in the schema, only registered for the table.
  */
 function inventoryTable(config: InventoryConfig): { fn: VgiFunction; table: TableDescriptor } {
+  const columns = config.rowId ? schema([...config.columns.fields, rowIdField()]) : config.columns;
   const fn = defineTableFunction<Record<string, never>, DoneState>({
     name: `${config.name}_scan`,
-    description: `Backing scan for the ${config.name} table`,
-    onBind: () => ({ outputSchema: config.columns }),
+    description: config.rowId
+      ? `Every row of the ${config.name} table, with its rowid (what UPDATE uses)`
+      : `Backing scan for the ${config.name} table`,
+    ...(config.rowId
+      ? { projectionPushdown: true, tags: config.scanTags ?? {}, examples: config.scanExamples ?? [] }
+      : {}),
+    onBind: () => ({ outputSchema: columns }),
     initialState: () => ({ done: false }),
     process: async (params, state, out) => {
       if (state.done) {
@@ -85,7 +104,7 @@ function inventoryTable(config: InventoryConfig): { fn: VgiFunction; table: Tabl
   const table: TableDescriptor = {
     name: config.name,
     comment: config.description,
-    columns: config.columns,
+    columns,
     function: fn,
     constraints: [
       ...[config.primaryKey, ...config.notNull].map((col) =>
@@ -148,13 +167,34 @@ export const LIGHTS = resultColumns([
   ["device_id", utf8(), "VARCHAR", "Id of the physical device that owns the light."],
 ]);
 
+/**
+ * A light's rowid: FNV-1a (64-bit) of its CLIP v2 id, masked to 62 bits so it
+ * is a positive BIGINT. Deterministic, so the same light has the same rowid in
+ * every scan, worker process and session, with nothing stored. `lightRows`
+ * refuses a (astronomically unlikely) collision rather than mixing lights up.
+ */
+export function lightRowId(id: string): bigint {
+  let h = 0xcbf29ce484222325n;
+  for (const byte of new TextEncoder().encode(id)) {
+    h ^= BigInt(byte);
+    h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return h & 0x3fffffffffffffffn;
+}
+
 export function lightRows(lights: HueLight[], devices: HueDevice[], groups: HueGroup[], zigbee: HueZigbee[]): Columns {
   const deviceById = byId(devices);
   const rooms = roomByDevice(groups);
   const reachable = reachableByDevice(zigbee);
   const sorted = [...lights].sort((a, b) => (a.metadata?.name ?? "").localeCompare(b.metadata?.name ?? ""));
-  const cols: Columns = Object.fromEntries(LIGHTS.names.map((n) => [n, []]));
+  const cols: Columns = Object.fromEntries([...LIGHTS.names, "rowid"].map((n) => [n, []]));
+  const seen = new Map<bigint, string>();
   for (const l of sorted) {
+    const rowid = lightRowId(l.id);
+    const clash = seen.get(rowid);
+    if (clash) throw new Error(`lights ${clash} and ${l.id} hash to the same rowid; please report this`);
+    seen.set(rowid, l.id);
+    cols.rowid?.push(rowid);
     const device = deviceById.get(l.owner.rid);
     const mirek = l.color_temperature?.mirek ?? null;
     const xy = l.color?.xy;
@@ -185,6 +225,29 @@ export const lightsTable = inventoryTable({
   primaryKey: "light_id",
   notNull: ["device_id"],
   columns: LIGHTS.schema,
+  rowId: true,
+  scanTags: {
+    "vgi.result_columns_schema": JSON.stringify([
+      ...JSON.parse(LIGHTS.tag),
+      { name: "rowid", type: "BIGINT", description: "Stable row id of the light (a hash of light_id)." },
+    ]),
+    ...objectTags({
+      title: "Lights (scan with rowid)",
+      category: "inventory",
+      keywords: "hue, lights, scan, rowid, update",
+      docLlm:
+        "The table function behind `hue.main.lights`: the same rows, plus DuckDB's `rowid` when " +
+        "it is selected. Query the `hue.main.lights` table instead; this function exists so DuckDB " +
+        "can scan the table for UPDATE.",
+      docMd: "## lights_scan()\n\nThe scan behind `hue.main.lights`; query the table instead.",
+    }),
+  },
+  scanExamples: [
+    {
+      sql: "SELECT name, is_on FROM hue.main.lights_scan() WHERE room = 'Kitchen' ORDER BY name",
+      description: "The kitchen's lights, read through the scan function",
+    },
+  ],
   description: "Every light on the Hue bridge with its room, on/off state, brightness and colour",
   load: async (params) => {
     const c = await conn(params);
@@ -205,12 +268,21 @@ export const lightsTable = inventoryTable({
         "List every light on the attached Hue bridge, one row per light, with its current state: " +
         "`light_id`, `name`, `room`, `is_on`, `brightness` (0–100), colour (`color_mode`, " +
         "`color_temperature_kelvin`, `color_x`/`color_y`, approximate `color_hex`), `reachable`, " +
-        "and hardware details. Takes no arguments. Use it to find lights to control: feed " +
-        "`light_id` or `name` to `set_light`, or a query over it to `set_lights`.",
-      docMd: "## lights\n\nEvery light on the bridge with its current state and room.",
+        "and hardware details. Takes no arguments. The table is writable with UPDATE: WHERE " +
+        "picks the lights and SET changes them. Updatable columns are `is_on`, `brightness`, " +
+        "`color_temperature_kelvin`, `color_hex` ('#rrggbb' or a basic colour name) and `name` " +
+        "(renames the light); RETURNING shows the rows as written. Other columns belong to the " +
+        "bridge and cannot be updated. `set_light` and `set_lights` do the same through functions.",
+      docMd:
+        "## lights\n\nEvery light on the bridge with its current state and room. Writable: " +
+        "UPDATE its `is_on`, `brightness`, `color_temperature_kelvin`, `color_hex` or `name`.",
     }),
   },
   examples: [
+    {
+      sql: "UPDATE hue.main.lights SET is_on = true, brightness = 40 WHERE room = 'Kitchen' RETURNING name, brightness",
+      description: "Turn the kitchen's lights on at 40% and show what changed",
+    },
     {
       sql: "SELECT room, count(*) AS lights, count(*) FILTER (WHERE is_on) AS lit FROM hue.main.lights GROUP BY room ORDER BY room",
       description: "How many lights are on in each room",

@@ -351,3 +351,101 @@ query I
 SELECT count(*) FROM (DESCRIBE SELECT * FROM hue_noopts.main.sensors);
 ----
 14
+
+# ------------------------------------------------------------------ UPDATE
+
+# Every light has a stable rowid (a hash of its id): same value on every scan.
+query I
+SELECT count(DISTINCT rowid) = count(*) AND min(rowid) > 0 FROM hue.main.lights;
+----
+true
+
+query I
+SELECT (SELECT rowid FROM hue.main.lights WHERE light_id = 'l-sofa') = (SELECT rowid FROM hue.main.lights WHERE light_id = 'l-sofa');
+----
+true
+
+statement ok
+UPDATE hue.main.lights SET is_on = true, brightness = 45 WHERE room = 'Kitchen';
+
+query TTR
+SELECT name, is_on, brightness FROM hue.main.lights WHERE room = 'Kitchen' ORDER BY name;
+----
+Kitchen ceiling	true	45.0
+Kitchen pendant	true	45.0
+
+# White temperature on the ambiance bulb; RETURNING shows the row as written.
+query TTI
+UPDATE hue.main.lights SET color_temperature_kelvin = 2700 WHERE light_id = 'l-ceiling' RETURNING name, color_mode, color_temperature_kelvin;
+----
+Kitchen ceiling	color_temperature	2703
+
+query TTT
+UPDATE hue.main.lights SET color_hex = '#ff0000', is_on = true WHERE light_id = 'l-sofa' RETURNING name, color_mode, color_hex;
+----
+Sofa lamp	xy	#ff0000
+
+query RR
+SELECT color_x, color_y FROM hue.main.lights WHERE light_id = 'l-sofa';
+----
+0.7006	0.2993
+
+# Rename on the bridge, and read it back.
+statement ok
+UPDATE hue.main.lights SET name = 'Reading lamp' WHERE light_id = 'l-desk';
+
+query T
+SELECT name FROM hue.main.lights WHERE light_id = 'l-desk';
+----
+Reading lamp
+
+# SET can compute from the current value.
+statement ok
+UPDATE hue.main.lights SET brightness = 30 WHERE light_id = 'l-sofa';
+
+query I
+UPDATE hue.main.lights SET brightness = brightness + 10 WHERE light_id = 'l-sofa' RETURNING brightness;
+----
+40.0
+
+# A statement matching no light changes nothing.
+statement ok
+UPDATE hue.main.lights SET is_on = false WHERE room = 'Attic';
+
+# Read-only columns are refused, before any light changes.
+statement error
+UPDATE hue.main.lights SET room = 'Attic';
+----
+cannot UPDATE 'room' of hue.main.lights
+
+statement error
+UPDATE hue.main.lights SET reachable = true WHERE light_id = 'l-desk';
+----
+cannot UPDATE 'reachable'
+
+statement error
+UPDATE hue.main.lights SET brightness = 150 WHERE light_id = 'l-sofa';
+----
+brightness must be 0–100
+
+statement error
+UPDATE hue.main.lights SET brightness = NULL WHERE light_id = 'l-sofa';
+----
+cannot SET brightness = NULL
+
+statement error
+UPDATE hue.main.lights SET name = '' WHERE light_id = 'l-sofa';
+----
+1-32 characters
+
+# The bridge's own refusal (a white-only bulb has no colour) carries the status.
+statement error
+UPDATE hue.main.lights SET color_hex = '#0000ff' WHERE light_id = 'l-pendant';
+----
+HTTP 400
+
+# The other tables are read-only.
+statement error
+UPDATE hue.main.rooms SET name = 'Den';
+----
+<REGEX>:.*
