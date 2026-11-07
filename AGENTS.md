@@ -25,15 +25,17 @@ src/
   worker.ts        # entry point: serves the catalog over stdio, --unix or --http
   catalog.ts       # assembles the catalog; add new functions to FUNCTIONS
   meta.ts          # catalog/schema metadata + helpers (objectTags, column)
-  greet.ts         # scalar example (overloads, const param with choices)
-  sequence.ts      # table function example (named args, streaming state)
-  fetch_items.ts   # REST API table function (pagination, retries, secrets)
+  attach.ts        # bridge / app_key ATTACH options -> attach_opaque_data (HueCatalogInterface)
+  discovery.ts     # bridge discovery: cache, mDNS, discovery.meethue.com
+  hue.ts           # Hue CLIP v2 client (retries, pacing), colour math, PUT bodies
+  inventory.ts     # lights / rooms / scenes / sensors catalog tables (scan functions)
+  control.ts       # set_light / set_room / recall_scene table fns, set_lights table in-out
   cli.ts           # flag parsing: stdio / --unix / --http (PORT:<n>, /health)
   log.ts           # stderr logger
-bin/               # vgi-starter-worker (what DuckDB launches) and run-recipe
+bin/               # vgi-hue-worker (what DuckDB launches) and run-recipe
 tests/             # bun unit tests (worker subprocess + mock API)
 test/sql/          # sqllogictest files run through DuckDB
-test/mock_api/     # offline mock of the REST API used by tests
+test/mock_bridge/  # stateful offline mock of a Hue bridge used by every test
 examples/          # recipes: pushdown, caching, catalog tables, aggregates, COPY …
 ci/                # integration harness used by `make test-sql` and CI
 scripts/           # vgi_template.py (init / template-diff)
@@ -42,8 +44,10 @@ vgi-agent-tests.yaml  # private graders for the agent test tasks
 
 ## Recipe: add a function
 
-1. Create `src/<name>.ts`. Copy the closest example: `greet.ts` for a scalar,
-   `sequence.ts` for a generator, `fetch_items.ts` for an API.
+1. Create `src/<name>.ts` or extend `inventory.ts` (read-only tables) / `control.ts`
+   (commands). Read the bridge connection with `connectionFor(bindCall)` from `attach.ts`.
+   Scalars cannot reach the bridge (their compute is synchronous and sees no attach data),
+   so anything that calls the bridge is a table or table in-out function.
 2. Declare arguments: `params` + `argDocs` (scalars), or the ordered `parameters`
    list when a constant needs `choices`/`ge`/`le`. Table functions use `args`,
    `argDocs` and `argConstraints`; an argument listed in `argDefaults` becomes a
@@ -58,11 +62,11 @@ Then, for every new function:
    keywords, `doc_llm` (for agents: what it does, arguments, when to use it) and `doc_md`
    (for humans). Describe each argument, and for table functions describe the result
    columns. Add 1–2 `examples` with fully qualified, analytical SQL
-   (`starter.main.fn(...)`): project, filter or aggregate rather than `SELECT *`.
+   (`hue.main.fn(...)`): project, filter or aggregate rather than `SELECT *`.
 2. **Executable examples:** if the function is deterministic and needs no network,
    add an `executable_examples` entry with `ORDER BY` and an `expected_result`.
-3. **SQL test:** add cases to `test/sql/starter.test`, or a new `test/sql/<name>.test`
-   with the same header (`require vgi`, `require-env STARTER_WORKER`, then `ATTACH`).
+3. **SQL test:** add cases to `test/sql/hue.test`, or a new `test/sql/<name>.test`
+   with the same header (`require vgi`, `require-env HUE_WORKER`, then `ATTACH`).
    Avoid expected-error text that depends on SDK wording; use `<REGEX>:.*` for errors you
    don't control.
 4. **Unit test** for any non-trivial logic.
@@ -115,15 +119,15 @@ Recipes for most kinds are in `examples/`.
   published so DuckDB and agents can discover them, but SDKs differ in which ones they
   enforce: some skip named table arguments, C# enforces none, and `pattern` matching
   differs (Java requires a full match). Where its SDK doesn't enforce a constraint, the
-  starter re-checks it in bind code. Do the same, and on a columnar scalar argument validate
+  hue re-checks it in bind code. Do the same, and on a columnar scalar argument validate
   values in the compute body.
 - **Reserved argument names.** DuckDB keywords such as `interval`, `end`, `from`, `order`
   and `table` break `name := value` syntax. Pick another name (`start_date`, `end_date`).
 - **State must be serializable.** Table-function state (`initialState`/`process`) must be a plain object of numbers, bigints, strings, booleans, arrays or nested plain objects (no `Date`, `Map` or class instances): the SDK infers an Arrow schema for it and serializes it. Over HTTP each batch can be served by a different process, so the cursor travels with the request. Keep it small, and never put secrets in it.
 - **Examples must be deterministic.** Add `ORDER BY`, and no `now()`, random values or
   network. Examples that hit a live API go in `examples`, not `executable_examples`.
-- **Credentials.** Read them from a DuckDB secret first (`CREATE SECRET (TYPE starter_api, …)`),
-  then from an environment variable. Never put them in logs, examples or the repo, and
+- **Credentials.** The bridge key arrives as the secret `app_key` ATTACH option (falling
+  back to `HUE_APP_KEY`). Never put them in logs, examples or the repo, and
   keep them out of table-function state unless the state rule above says
   the SDK encrypts it. Workers that need real credentials set `execute: false` on the metadata check.
 - **Errors.** Raise errors with a clear message. For HTTP failures, include the status
@@ -162,7 +166,7 @@ Recipes for most kinds are in `examples/`.
 ## Useful prompts
 
 - "Add a scalar `slugify(text VARCHAR) -> VARCHAR` with full metadata and tests."
-- "Replace `fetch_items` with a table function for <API>. Map its JSON to typed columns,
-  read the token from a `starter_api` secret, and add mock-server tests."
+- "Add a `devices` table listing every Hue device with its product data, with mock-bridge
+  fixtures and SQL tests."
 - "Add a catalog table `countries` (code, name) with a primary key, following
   `examples/catalog_tables`."

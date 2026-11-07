@@ -17,7 +17,7 @@ jobs:
   ci:
     # In the template repositories a vX.Y.Z tag is a template version, not a worker
     # release, so only a manual run builds there. Forks release on every tag.
-    if: ${{ github.event_name != 'push' || !startsWith(github.repository, 'Query-farm/vgi-starter-') }}
+    if: ${{ github.event_name != 'push' || !startsWith(github.repository, 'Query-farm/vgi-hue-') }}
     uses: ./.github/workflows/ci.yml
 
   release:
@@ -29,6 +29,6 @@ jobs:
     uses: Query-farm/vgi-actions/.github/workflows/ts-release.yml@v1
     secrets: inherit
     with:
-      bin: vgi-starter-worker
+      bin: vgi-hue-worker
       entry: src/worker.ts
       version_check_cmd: ci/check-version.sh

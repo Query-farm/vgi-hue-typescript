@@ -1,16 +1,28 @@
 # Private graders for the public vgi.agent_test_tasks in the worker's catalog metadata.
-# `vgi-lint lint --ai` runs an agent on each prompt and grades it with check_sql.
+# `make lint-ai` runs an agent on each prompt and grades it with these, with the worker
+# attached to the mock bridge (test/mock_bridge/server.py), whose state the control tasks change.
 # See https://github.com/Query-farm/vgi-lint-check (VGI920).
 tasks:
-  - name: formal_greeting
-    reference_sql: SELECT starter.main.greet('Grace', 'formal') AS greeting
-  - name: sum_of_squares
-    reference_sql: SELECT sum(squared) AS total FROM starter.main.sequence_table(10)
-  - name: stepped_sequence
-    reference_sql: SELECT n FROM starter.main.sequence_table(4, step := 5) ORDER BY n
-  # Reads the public demo API (https://vgi-starter-api.query-farm.services/v1).
-  - name: items_per_category
-    check_sql: >-
-      SELECT count(*) = 3 AND sum(items) = 25
-      FROM (SELECT category, count(*) AS items
-            FROM starter.main.fetch_items('https://vgi-starter-api.query-farm.services/v1') GROUP BY category)
+  - name: lights_on_per_room
+    reference_sql: >-
+      SELECT room, count(*) FILTER (WHERE is_on) AS lights_on
+      FROM hue.main.lights GROUP BY room ORDER BY room
+  - name: active_scenes
+    reference_sql: SELECT room, name FROM hue.main.scenes WHERE active ORDER BY room
+  - name: biggest_room
+    reference_sql: >-
+      SELECT name FROM hue.main.rooms WHERE kind = 'room' ORDER BY light_count DESC, name LIMIT 1
+  - name: warmest_room
+    reference_sql: >-
+      SELECT room FROM hue.main.sensors WHERE kind = 'temperature'
+      ORDER BY temperature_c DESC LIMIT 1
+  - name: kitchen_off
+    reference_sql: SELECT target_type, name, ok FROM hue.main.set_room('Kitchen', power := false)
+  - name: dim_sofa
+    reference_sql: SELECT name, ok FROM hue.main.set_light('Sofa lamp', brightness := 30)
+  - name: relax_living_room
+    reference_sql: SELECT name, ok FROM hue.main.recall_scene('Relax', room := 'Living room')
+  - name: warm_white_everywhere
+    reference_sql: >-
+      SELECT count(*) FILTER (WHERE ok) AS changed FROM hue.main.set_lights(
+        (SELECT light_id, name FROM hue.main.lights WHERE color_mode IS NOT NULL), kelvin := 2700)

@@ -1,17 +1,20 @@
 /**
  * Assemble the functions into the catalog DuckDB attaches.
  *
- * To add a function: write it (see `greet.ts` / `sequence.ts` /
- * `fetch_items.ts`), then add it to `FUNCTIONS` below.
+ * To add a function: write it, then add it to `FUNCTIONS` below.
+ * The `bridge` / `app_key` ATTACH options are declared in `attach.ts`.
  */
 
 import type { CatalogDescriptor, VgiFunction } from "@query-farm/vgi";
-import { API_SECRET_TYPE, fetchItems } from "./fetch_items.ts";
-import { greet, greetWithStyle } from "./greet.ts";
+import { recallSceneFn, setLightFn, setLightsFn, setRoomFn } from "./control.ts";
+import { lightsTable, roomsTable, scenesTable, sensorsTable } from "./inventory.ts";
 import { CATALOG_DOC_MD, CATALOG_NAME, CATALOG_TAGS, SCHEMA_DOC_MD, SCHEMA_TAGS, SOURCE_URL } from "./meta.ts";
-import { sequenceTable } from "./sequence.ts";
 
-export const FUNCTIONS: VgiFunction[] = [greet, greetWithStyle, sequenceTable, fetchItems];
+/** Read-only inventory, exposed as tables: SELECT * FROM hue.main.lights. */
+export const TABLES = [lightsTable, roomsTable, scenesTable, sensorsTable].map((t) => t.table);
+
+/** Control functions. */
+export const FUNCTIONS: VgiFunction[] = [setLightFn, setRoomFn, recallSceneFn, setLightsFn];
 
 interface Example {
   description: string;
@@ -39,19 +42,22 @@ function stampExampleQueries(functions: VgiFunction[]): Example[] {
   return [...byName.values()].flat();
 }
 
-const ALL_EXAMPLES = stampExampleQueries(FUNCTIONS);
+const ALL_EXAMPLES = [
+  ...TABLES.flatMap((t) => JSON.parse(t.tags?.["vgi.example_queries"] ?? "[]") as Example[]),
+  ...stampExampleQueries(FUNCTIONS),
+];
 
 export const CATALOG: CatalogDescriptor = {
   name: CATALOG_NAME,
   comment: CATALOG_DOC_MD,
   sourceUrl: SOURCE_URL,
   tags: CATALOG_TAGS,
-  secretTypes: [API_SECRET_TYPE],
   schemas: [
     {
       path: ["main"],
       comment: SCHEMA_DOC_MD,
       functions: FUNCTIONS,
+      tables: TABLES,
       tags: { ...SCHEMA_TAGS, "vgi.example_queries": JSON.stringify(ALL_EXAMPLES) },
     },
   ],

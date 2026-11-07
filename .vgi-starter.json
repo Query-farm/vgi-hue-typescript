@@ -13,5 +13,8 @@
   "optional_files": [
     ".github/workflows/nightly.yml",
     ".github/dependabot.yml"
-  ]
+  ],
+  "name": "hue",
+  "repo": "your-org/vgi-hue",
+  "initialized": "2026-11-07"
 }

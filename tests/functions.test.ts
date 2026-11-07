@@ -1,54 +1,243 @@
 // Unit tests. The SQL-level tests live in test/sql and run through DuckDB.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Arguments, VgiClient } from "@query-farm/vgi";
 import { subprocessConnect } from "@query-farm/vgi-rpc";
-import { getJson, parsePage, resolveToken } from "../src/fetch_items.ts";
-import { greetAll } from "../src/greet.ts";
-import { sequenceColumns } from "../src/sequence.ts";
+import { decodeAttachOptions, encodeAttachOptions } from "../src/attach.ts";
+import { matchByIdOrName, recallScene, setLight, setRoom } from "../src/control.ts";
+import { candidateUrl, chooseBridge, discoverBridge, isBridgeId, mdnsQuery } from "../src/discovery.ts";
+import {
+  type BridgeConnection,
+  buildStateBody,
+  getResources,
+  type HueLight,
+  hueRequest,
+  kelvinToMirek,
+  lightLevelToLux,
+  parseColor,
+  resolveConnection,
+  rgbToXy,
+  xyToHex,
+} from "../src/hue.ts";
+import { lightRows, roomRows } from "../src/inventory.ts";
 
 const ROOT = join(import.meta.dir, "..");
 
-test("greet: casual and formal, NULL stays NULL", () => {
-  const names = ["Ada", null, "Grace"];
-  expect(greetAll(names, "casual")).toEqual(["Hi, Ada!", null, "Hi, Grace!"]);
-  expect(greetAll(names, "formal")).toEqual(["Good day, Ada.", null, "Good day, Grace."]);
+describe("connection settings", () => {
+  const noDiscovery = async (): Promise<never> => {
+    throw new Error("discovery should not run");
+  };
+
+  test("ATTACH options win over the environment", async () => {
+    const env = { HUE_BRIDGE: "10.0.0.9", HUE_APP_KEY: "env-key" };
+    expect(await resolveConnection({ bridge: "192.168.1.20", app_key: "opt-key" }, env, noDiscovery)).toEqual({
+      baseUrl: "https://192.168.1.20",
+      appKey: "opt-key",
+    });
+    expect(await resolveConnection({}, env, noDiscovery)).toEqual({ baseUrl: "https://10.0.0.9", appKey: "env-key" });
+    expect((await resolveConnection({ bridge: "http://127.0.0.1:8080/" }, env, noDiscovery)).baseUrl).toBe(
+      "http://127.0.0.1:8080",
+    );
+  });
+
+  test("a missing app key is an error before any discovery", async () => {
+    await expect(resolveConnection({ bridge: "x" }, {}, noDiscovery)).rejects.toThrow(/No Hue app key/);
+    await expect(resolveConnection({}, {}, noDiscovery)).rejects.toThrow(/No Hue app key/);
+  });
+
+  test("no bridge, or a bridge id, goes to discovery", async () => {
+    const seen: (string | null)[] = [];
+    const fake = async (id: string | null) => {
+      seen.push(id);
+      return { id: "001788fffe00beef", name: null, url: "https://192.168.1.77" };
+    };
+    expect((await resolveConnection({ app_key: "k" }, {}, fake)).baseUrl).toBe("https://192.168.1.77");
+    expect((await resolveConnection({ app_key: "k", bridge: "001788FFFE00BEEF" }, {}, fake)).baseUrl).toBe(
+      "https://192.168.1.77",
+    );
+    expect(seen).toEqual([null, "001788FFFE00BEEF"]);
+  });
+
+  test("attach options round-trip through attach_opaque_data", () => {
+    const bytes = encodeAttachOptions({ bridge: " 1.2.3.4 ", app_key: "k", other: 5 });
+    expect(decodeAttachOptions(bytes)).toEqual({ bridge: "1.2.3.4", app_key: "k" });
+    expect(decodeAttachOptions(encodeAttachOptions(undefined))).toEqual({});
+    expect(decodeAttachOptions(new Uint8Array([1, 2, 3]))).toEqual({});
+    expect(decodeAttachOptions(null)).toEqual({});
+  });
 });
 
-test("sequence: columns for a window of rows", () => {
-  expect(sequenceColumns(2, 3, 5n)).toEqual({ n: [10n, 15n, 20n], squared: [100n, 225n, 400n] });
+describe("discovery", () => {
+  const bridge = (id: string, url: string) => ({ id, name: null, url });
+
+  test("bridge ids are 16 hex digits", () => {
+    expect(isBridgeId("001788fffe00BEEF")).toBe(true);
+    expect(isBridgeId("192.168.1.20")).toBe(false);
+  });
+
+  test("candidate URLs omit default ports and bracket IPv6", () => {
+    expect(candidateUrl({ host: "192.168.1.2", port: 443 })).toBe("https://192.168.1.2");
+    expect(candidateUrl({ host: "192.168.1.2", port: 8443 })).toBe("https://192.168.1.2:8443");
+    expect(candidateUrl({ host: "fe80::1" })).toBe("https://[fe80::1]");
+  });
+
+  test("choosing: one bridge, a wanted id, none, or several", () => {
+    const a = bridge("aaaaaaaaaaaaaaaa", "https://10.0.0.1");
+    const b = bridge("bbbbbbbbbbbbbbbb", "https://10.0.0.2");
+    expect(chooseBridge([a], null)).toBe(a);
+    expect(chooseBridge([a, b], "BBBBBBBBBBBBBBBB")).toBe(b);
+    expect(() => chooseBridge([], null)).toThrow(/no Hue bridge found/);
+    expect(() => chooseBridge([a, b], null)).toThrow(/found 2 Hue bridges/);
+    expect(() => chooseBridge([a], "cccccccccccccccc")).toThrow(/no Hue bridge with id/);
+  });
+
+  test("the mDNS query asks for _hue._tcp.local PTR records", () => {
+    const q = mdnsQuery();
+    expect(new TextDecoder().decode(q.slice(13, 17))).toBe("_hue");
+    expect([...q.slice(-4)]).toEqual([0, 12, 0, 1]);
+  });
+
+  test("mDNS results are tried first, then the cloud; unconfirmed hosts are dropped", async () => {
+    const probe = async (url: string) => (url === "https://10.0.0.5" ? { id: "001788fffe000005", name: "Home" } : null);
+    let cloudCalled = false;
+    const found = await discoverBridge(null, {
+      env: {},
+      cacheFile: null,
+      mdns: async () => [{ host: "10.0.0.9" }, { host: "10.0.0.5" }],
+      cloud: async () => {
+        cloudCalled = true;
+        return [];
+      },
+      probe,
+    });
+    expect(found).toEqual({ id: "001788fffe000005", name: "Home", url: "https://10.0.0.5" });
+    expect(cloudCalled).toBe(false);
+  });
+
+  test("the cloud fills in when mDNS finds nothing", async () => {
+    const found = await discoverBridge(null, {
+      env: { HUE_DISCOVERY_MDNS: "off" },
+      cacheFile: null,
+      cloud: async () => [{ host: "10.0.0.6", port: 443, id: "001788fffe000006" }],
+      probe: async () => ({ id: "001788fffe000006", name: null }),
+    });
+    expect(found.url).toBe("https://10.0.0.6");
+  });
+
+  test("HUE_DISCOVERY=off refuses to guess", async () => {
+    await expect(discoverBridge(null, { env: { HUE_DISCOVERY: "off" }, cacheFile: null })).rejects.toThrow(
+      /discovery is off/,
+    );
+  });
 });
 
-test("fetch_items: token comes from the secret, then the environment", () => {
-  const saved = process.env.STARTER_API_TOKEN;
-  process.env.STARTER_API_TOKEN = "from-env";
-  try {
-    expect(resolveToken({ my_secret: { type: "starter_api", token: "from-secret" } })).toBe("from-secret");
-    expect(resolveToken({})).toBe("from-env");
-  } finally {
-    if (saved === undefined) delete process.env.STARTER_API_TOKEN;
-    else process.env.STARTER_API_TOKEN = saved;
-  }
+describe("colour math", () => {
+  test("kelvin to mirek clamps to the Hue range", () => {
+    expect(kelvinToMirek(2700)).toBe(370);
+    expect(kelvinToMirek(1000)).toBe(500);
+    expect(kelvinToMirek(10000)).toBe(153);
+  });
+
+  test("colours parse from hex, short hex and names", () => {
+    expect(parseColor("#FF8000")).toEqual([255, 128, 0]);
+    expect(parseColor("f80")).toEqual([255, 136, 0]);
+    expect(parseColor("Blue")).toEqual([0, 0, 255]);
+    expect(() => parseColor("#12345")).toThrow(/invalid color/);
+  });
+
+  test("rgb -> xy -> hex keeps the primary hue", () => {
+    const red = rgbToXy([255, 0, 0]);
+    expect(red).toEqual({ x: 0.7006, y: 0.2993 });
+    expect(xyToHex(red.x, red.y).slice(1, 3)).toBe("ff");
+    expect(rgbToXy([0, 0, 0])).toEqual({ x: 0.3127, y: 0.329 });
+  });
+
+  test("light level to lux", () => {
+    expect(lightLevelToLux(1)).toBe(1);
+    expect(lightLevelToLux(20001)).toBe(100);
+  });
 });
 
-test("fetch_items: parsePage reads items and next_page", () => {
-  const body = { items: [{ id: 1, name: "a", category: "c", price: 1.5 }], next_page: null };
-  expect(parsePage(body)).toEqual({ items: body.items, nextPage: null });
+describe("state bodies", () => {
+  test("brightness implies on unless power says otherwise", () => {
+    expect(buildStateBody({ brightness: 50 })).toEqual({ dimming: { brightness: 50 }, on: { on: true } });
+    expect(buildStateBody({ brightness: 50, on: false })).toEqual({ dimming: { brightness: 50 }, on: { on: false } });
+    expect(buildStateBody({ brightness: 0 })).toEqual({ on: { on: false } });
+  });
+
+  test("invalid combinations are rejected", () => {
+    expect(() => buildStateBody({})).toThrow(/nothing to change/);
+    expect(() => buildStateBody({ transition_ms: 100 })).toThrow(/nothing to change/);
+    expect(() => buildStateBody({ kelvin: 3000, color: "red" })).toThrow(/either kelvin or color/);
+    expect(() => buildStateBody({ brightness: 0, on: true })).toThrow(/turns the light off/);
+    expect(() => buildStateBody({ kelvin: 9000 })).toThrow(/2000–6500/);
+  });
+
+  test("matching prefers ids, then case-insensitive names", () => {
+    const items = [
+      { id: "a", metadata: { name: "Lamp" } },
+      { id: "b", metadata: { name: "lamp" } },
+      { id: "Lamp", metadata: { name: "Other" } },
+    ];
+    expect(matchByIdOrName(items, "Lamp").map((i) => i.id)).toEqual(["Lamp"]);
+    expect(matchByIdOrName(items, "LAMP").map((i) => i.id)).toEqual(["a", "b"]);
+  });
 });
 
-describe("against the worker and the mock API", () => {
-  let client: VgiClient;
+describe("row building", () => {
+  const light = (id: string, owner: string, name: string, extra: Partial<HueLight> = {}): HueLight => ({
+    id,
+    owner: { rid: owner, rtype: "device" },
+    metadata: { name },
+    ...extra,
+  });
+
+  test("lights get rooms, reachability and colour mode; empty input gives no rows", () => {
+    const cols = lightRows(
+      [
+        light("l2", "d2", "B", { color: { xy: { x: 0.5, y: 0.4 } }, color_temperature: { mirek: null } }),
+        light("l1", "d1", "A", { on: { on: true }, color_temperature: { mirek: 250 } }),
+      ],
+      [],
+      [{ id: "r", type: "room", metadata: { name: "Den" }, children: [{ rid: "d1", rtype: "device" }] }],
+      [{ id: "z", owner: { rid: "d1", rtype: "device" }, status: "connected" }],
+    );
+    expect(cols.name).toEqual(["A", "B"]);
+    expect(cols.room).toEqual(["Den", null]);
+    expect(cols.color_mode).toEqual(["color_temperature", "xy"]);
+    expect(cols.color_temperature_kelvin).toEqual([4000, null]);
+    expect(cols.reachable).toEqual([true, null]);
+    expect(lightRows([], [], [], []).light_id).toEqual([]);
+  });
+
+  test("zones list lights directly, rooms list devices", () => {
+    const lights = [light("l1", "d1", "A"), light("l2", "d2", "B")];
+    const cols = roomRows(
+      [
+        { id: "z", type: "zone", metadata: { name: "Z" }, children: [{ rid: "l2", rtype: "light" }] },
+        { id: "r", type: "room", metadata: { name: "R" }, children: [{ rid: "d1", rtype: "device" }] },
+      ],
+      [],
+      lights,
+    );
+    expect(cols.name).toEqual(["R", "Z"]);
+    expect(cols.light_names).toEqual([["A"], ["B"]]);
+  });
+});
+
+describe("against the mock bridge", () => {
   let mock: ReturnType<typeof Bun.spawn>;
-  let mockUrl: string;
+  let conn: BridgeConnection;
+  let client: VgiClient;
 
   beforeAll(async () => {
-    // A client that launches the worker as a subprocess, the way DuckDB does.
-    client = new VgiClient(subprocessConnect([process.execPath, "run", join(ROOT, "src", "worker.ts")]));
-    // The mock API prints PORT:<n> once it is listening.
-    mock = Bun.spawn([process.env.PYTHON ?? "python3", join(ROOT, "test", "mock_api", "server.py")], {
+    mock = Bun.spawn([process.env.PYTHON ?? "python3", join(ROOT, "test", "mock_bridge", "server.py")], {
       stdout: "pipe",
-      stderr: "inherit",
+      stderr: "ignore",
+      env: { ...process.env, MOCK_FLAKY: "1" },
     });
     const reader = (mock.stdout as ReadableStream<Uint8Array>).getReader();
     let text = "";
@@ -59,8 +248,14 @@ describe("against the worker and the mock API", () => {
     }
     reader.releaseLock();
     const port = text.match(/^PORT:(\d+)/)?.[1];
-    if (!port) throw new Error(`mock API did not report a port: ${text}`);
-    mockUrl = `http://127.0.0.1:${port}`;
+    if (!port) throw new Error(`mock bridge did not report a port: ${text}`);
+    conn = { baseUrl: `http://127.0.0.1:${port}`, appKey: "test-key" };
+    // The worker as DuckDB launches it, with the bridge given through its environment.
+    client = new VgiClient(
+      subprocessConnect([process.execPath, "run", join(ROOT, "src", "worker.ts")], {
+        env: { HUE_BRIDGE: conn.baseUrl, HUE_APP_KEY: "test-key" },
+      }),
+    );
   });
 
   afterAll(() => {
@@ -68,51 +263,61 @@ describe("against the worker and the mock API", () => {
     mock?.kill();
   });
 
-  async function table(name: string, positional: unknown[], named: Record<string, unknown> = {}) {
+  test("discovery finds the mock through a discovery endpoint, and caches it", async () => {
+    const cacheFile = join(tmpdir(), `vgi-hue-test-${process.pid}.json`);
+    const env = {
+      HUE_DISCOVERY_URL: `${conn.baseUrl}/discovery`,
+      HUE_DISCOVERY_SCHEME: "http",
+      HUE_DISCOVERY_MDNS: "off",
+    };
+    try {
+      const found = await discoverBridge(null, { env, cacheFile });
+      expect(found).toEqual({ id: "001788fffe00beef", name: "Mock bridge", url: conn.baseUrl });
+      // With every source now returning nothing, it still resolves: from the cache.
+      const again = await discoverBridge(null, { env, cacheFile, cloud: async () => [], mdns: async () => [] });
+      expect(again.url).toBe(conn.baseUrl);
+      await expect(
+        discoverBridge(null, { env: { ...env, HUE_DISCOVERY_URL: `${conn.baseUrl}/discovery/none` }, cacheFile: null }),
+      ).rejects.toThrow(/no Hue bridge found/);
+    } finally {
+      rmSync(cacheFile, { force: true });
+    }
+  });
+
+  test("GET retries a 429 and returns data", async () => {
+    const lights = await getResources<HueLight>(conn, "light");
+    expect(lights.map((l) => l.id).sort()).toEqual(["l-ceiling", "l-desk", "l-pendant", "l-sofa"]);
+  });
+
+  test("errors carry the HTTP status", async () => {
+    await expect(hueRequest({ ...conn, appKey: "nope" }, "GET", "/resource/light")).rejects.toThrow(/HTTP 403/);
+    await expect(hueRequest(conn, "PUT", "/resource/light/missing", { on: { on: true } })).rejects.toThrow(/HTTP 404/);
+  });
+
+  test("unreachable bridge is reported clearly", async () => {
+    await expect(hueRequest({ baseUrl: "http://127.0.0.1:1", appKey: "k" }, "GET", "/resource/light")).rejects.toThrow(
+      /cannot reach the Hue bridge/,
+    );
+  }, 20_000);
+
+  test("set_light, set_room and recall_scene change state", async () => {
+    expect((await setLight(conn, "Sofa lamp", { on: true }))[0]?.target_id).toBe("l-sofa");
+    expect((await setRoom(conn, "Living room", { brightness: 20 }))[0]?.target_type).toBe("room");
+    const lights = await getResources<HueLight>(conn, "light");
+    expect(lights.find((l) => l.id === "l-sofa")?.dimming?.brightness).toBe(20);
+    await expect(recallScene(conn, "Relax", null)).rejects.toThrow(/several rooms/);
+    expect((await recallScene(conn, "Bright", "kitchen"))[0]?.target_id).toBe("s-bright-kitchen");
+  });
+
+  test("the worker falls back to HUE_BRIDGE / HUE_APP_KEY", async () => {
     const rows: Record<string, unknown>[] = [];
     for await (const page of client.tableFunctionRows({
-      functionName: name,
-      arguments: new Arguments(positional, new Map(Object.entries(named))),
+      functionName: "rooms_scan", // the scan behind the rooms table
+      arguments: new Arguments([], new Map()),
       int64: "bigint",
     })) {
       rows.push(...page);
     }
-    return rows;
-  }
-
-  // `int64: "bigint"` makes every BIGINT a bigint (the default mixes number and
-  // bigint by size); convert to numbers to compare against small literals.
-  const col = (rows: Record<string, unknown>[], name: string) => rows.map((r) => Number(r[name]));
-
-  test("sequence_table: default step", async () => {
-    const rows = await table("sequence_table", [4n]);
-    expect(col(rows, "n")).toEqual([0, 1, 2, 3]);
-    expect(col(rows, "squared")).toEqual([0, 1, 4, 9]);
-  });
-
-  test("sequence_table: named step", async () => {
-    const rows = await table("sequence_table", [3n], { step: 5n });
-    expect(col(rows, "n")).toEqual([0, 5, 10]);
-  });
-
-  test("sequence_table: streams in batches", async () => {
-    const rows = await table("sequence_table", [25_000n]);
-    expect(rows.length).toBe(25_000);
-    expect(col(rows, "n").at(-1)).toBe(24_999);
-  });
-
-  test("fetch_items: pages through the API", async () => {
-    const rows = await table("fetch_items", [mockUrl], { page_size: 4n });
-    expect(rows.length).toBe(25);
-    expect(col(rows, "id")).toEqual(Array.from({ length: 25 }, (_, i) => i + 1));
-    expect(new Set(rows.map((r) => r.category))).toEqual(new Set(["hardware", "software", "service"]));
-  });
-
-  test("fetch_items: rejects a non-http URL at bind", async () => {
-    await expect(table("fetch_items", ["ftp://example.com"])).rejects.toThrow(/pattern/i);
-  });
-
-  test("getJson: error names the HTTP status", async () => {
-    await expect(getJson(`${mockUrl}/nope`)).rejects.toThrow(/HTTP 404/);
+    expect(rows.map((r) => r.name)).toEqual(["Hallway", "Kitchen", "Living room", "Downstairs"]);
   });
 });

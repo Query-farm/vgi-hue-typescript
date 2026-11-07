@@ -10,21 +10,21 @@
  *   `SCHEMA_CATEGORIES`, search keywords, and LLM- and human-facing docs.
  */
 
-import { field, type VgiDataType, type VgiField } from "@query-farm/vgi";
+import { field, schema, type VgiDataType, type VgiField } from "@query-farm/vgi";
 
-export const CATALOG_NAME = "starter";
+export const CATALOG_NAME = "hue";
 export const VERSION = "0.1.0";
 
-export const SOURCE_URL = "https://github.com/Query-farm/vgi-starter-typescript";
+export const SOURCE_URL = "https://github.com/your-org/vgi-hue";
 
 /**
  * Categories group functions in docs and agent tools. Every object's
  * `vgi.category` must name one of these.
  */
 export const SCHEMA_CATEGORIES = [
-  { name: "text", title: "Text", description: "Functions that build or transform strings." },
-  { name: "generators", title: "Generators", description: "Table functions that generate rows." },
-  { name: "api", title: "REST APIs", description: "Table functions that read from HTTP APIs." },
+  { name: "inventory", title: "Inventory", description: "Lights, rooms, zones and scenes on the bridge." },
+  { name: "sensors", title: "Sensors", description: "Motion, temperature, light-level, contact and battery readings." },
+  { name: "control", title: "Control", description: "Functions that change the state of real lights." },
 ] as const;
 
 export type Category = (typeof SCHEMA_CATEGORIES)[number]["name"];
@@ -61,68 +61,84 @@ export function column(name: string, type: VgiDataType, comment: string, nullabl
   return field(name, type, nullable, new Map([["comment", comment]]));
 }
 
+/** [name, Arrow type, SQL type name, description, nullable?] for one result column. */
+export type ResultColumn = [string, VgiDataType, string, string, boolean?];
+
+/**
+ * Declare a table function's result once: the Arrow schema it emits, its column
+ * names, and the `vgi.result_columns_schema` tag that documents it.
+ */
+export function resultColumns(cols: ResultColumn[]) {
+  return {
+    schema: schema(cols.map(([name, type, , doc, nullable]) => column(name, type, doc, nullable ?? true))),
+    names: cols.map(([name]) => name),
+    tag: JSON.stringify(cols.map(([name, , sqlType, description]) => ({ name, type: sqlType, description }))),
+  };
+}
+
 export const CATALOG_DOC_LLM =
-  "An example VGI worker generated from the Query.Farm starter template. It shows the three " +
-  "shapes most workers need: a vectorized scalar function (`greet`, with a one- and two-argument " +
-  "overload), a deterministic table function with a named default argument (`sequence_table`), " +
-  "and a table function that pages through a REST API with retries and an optional bearer token " +
-  "taken from a DuckDB secret or an environment variable (`fetch_items`). Replace these with " +
-  "your own functions; keep the metadata complete so agents can discover and call them.";
+  "Read and control Philips Hue smart lighting from SQL through a Hue bridge on the local " +
+  "network (CLIP v2 API). Connect by passing the application key as the ATTACH option " +
+  "`app_key`; the bridge is found automatically on the local network, or set the `bridge` " +
+  "option to its address or bridge id (the worker's HUE_APP_KEY and HUE_BRIDGE environment " +
+  "variables are fallbacks). Concepts: every light belongs to a physical device; " +
+  "devices are placed in a room; a zone is any grouping of individual lights; a scene is a " +
+  "saved lighting state for one room or zone; a sensor is a service on a device (a Hue motion " +
+  "sensor also reports temperature, ambient light and battery). Inventory is exposed as " +
+  "tables that always read live bridge state. Changes are made with table functions that send " +
+  "a command when the query runs and return one row per change, matching targets by id or " +
+  "case-insensitive name; brightness is a percentage and white temperature is in Kelvin. They " +
+  "switch real lights in someone's home, so call them only when the user asks.";
 
 export const CATALOG_DOC_MD =
-  "# VGI starter worker\n\n" +
-  "**An example [VGI](https://query.farm/vgi) worker that brings custom functions into DuckDB " +
-  "SQL.** It was generated from the Query.Farm starter template and is meant to be renamed and " +
-  "rewritten: every function here demonstrates one pattern you will reuse.\n\n" +
-  "- `greet(name)` and `greet(name, style)`: a vectorized scalar with an overload and a " +
-  "constrained constant argument.\n" +
-  "- `sequence_table(count, step := 1)`: a deterministic table function that streams its " +
-  "output in batches.\n" +
-  "- `fetch_items(base_url, page_size := 100)`: wraps a paginated REST API, retrying politely " +
-  "and reading a bearer token from a DuckDB secret or the environment.\n\n" +
-  "The worker speaks Apache Arrow to DuckDB over stdin/stdout, a Unix socket, or HTTP, so the " +
-  "same code runs as a local subprocess or a hosted service. See the " +
-  "[VGI documentation](https://query.farm/vgi/docs/) to learn more.";
+  "# Philips Hue for DuckDB\n\n" +
+  "**Query and control your Hue lights with SQL.** This [VGI](https://query.farm/vgi) worker " +
+  "talks to a Hue bridge on your network: read the live state of every light, room, zone, " +
+  "scene and sensor as tables, join it with anything else in DuckDB, and switch lights from a " +
+  "query.\n\n" +
+  "Attach it with an application key (created by pressing the bridge's link button); the " +
+  "bridge itself is discovered on your network. Pass the key with `getenv(...)` to keep it out of your SQL; DuckDB " +
+  "redacts it either way.";
 
 export const SCHEMA_DOC_LLM =
-  "The `main` schema holds the starter template's example functions, one per common worker " +
-  "pattern. `greet(name)` and `greet(name, style)` are vectorized scalars: use them inside a " +
-  "projection or predicate, one result per row; `style` is a constant that must be 'casual' or " +
-  "'formal'. `sequence_table(count, step := 1)` is a deterministic table function that returns " +
-  "`count` rows of `(n, squared)`; use it for demos, tests, and as a template for generators. " +
-  "`fetch_items(base_url, page_size := 100)` reads every item from a paginated JSON REST API as " +
-  "`(id, name, category, price)` rows, streaming one page per batch, retrying rate-limited " +
-  "requests, and authenticating with a `starter_api` DuckDB secret or the `STARTER_API_TOKEN` " +
-  "environment variable. Scalars cannot take named arguments; table functions can.";
+  "Everything for the attached Hue bridge lives in `main`. The inventory tables take no " +
+  "arguments and reflect the bridge at query time; filter and join them like any table. The " +
+  "control functions take a target (id or case-insensitive name) plus named, optional state " +
+  "arguments, at least one of which is required: `power := true|false` (on/off; `on` is a SQL " +
+  "keyword), `brightness := 0..100` (above 0 implies on, 0 turns off), `kelvin := 2000..6500` " +
+  "or `color := '#rrggbb'` (one or the other) and `transition_ms` (fade time). Each returns " +
+  "rows of `target_type`, `target_id`, `name`, `ok`, `error`, `request`. For many lights at " +
+  "once, feed a query that has a `light_id` column into the bulk function.";
 
 export const SCHEMA_DOC_MD =
   "## main\n\n" +
-  "The starter template's example functions, one per common worker pattern.\n\n" +
-  "- **Scalars** answer one question per row and slot into a projection or predicate.\n" +
-  "- **Table functions** return sets of rows, streamed to DuckDB in Arrow batches.\n" +
-  "- **REST readers** page through an HTTP API and authenticate with a DuckDB secret.";
+  "Every table and function for the attached Hue bridge.\n\n" +
+  "- **Inventory tables** show what exists and its live state.\n" +
+  "- **Control functions** change a light, a room or zone, or recall a scene, and return " +
+  "what they sent.";
 
 export const AGENT_TEST_TASKS = [
-  { name: "formal_greeting", prompt: "Using the starter worker, greet the name 'Grace' formally." },
+  { name: "lights_on_per_room", prompt: "Using the hue worker, how many lights are on in each room?" },
+  { name: "active_scenes", prompt: "Using the hue worker, which scene is currently active in each room?" },
+  { name: "biggest_room", prompt: "Using the hue worker, which room has the most lights?" },
   {
-    name: "sum_of_squares",
-    prompt:
-      "Using the starter worker, what is the sum of the squared column for the first 10 rows " +
-      "of the sequence with the default step?",
+    name: "warmest_room",
+    prompt: "Using the hue worker, which room has the highest temperature sensor reading?",
+  },
+  { name: "kitchen_off", prompt: "Using the hue worker, turn off all the lights in the Kitchen." },
+  { name: "dim_sofa", prompt: "Using the hue worker, set the Sofa lamp to 30% brightness." },
+  {
+    name: "relax_living_room",
+    prompt: "Using the hue worker, activate the Relax scene in the Living room.",
   },
   {
-    name: "stepped_sequence",
-    prompt: "List the n values of a 4-row sequence that steps by 5, in ascending order.",
-  },
-  {
-    name: "items_per_category",
-    prompt:
-      "The items API is running at https://vgi-starter-api.query-farm.services/v1. How many items does it have in each category?",
+    name: "warm_white_everywhere",
+    prompt: "Using the hue worker, set every light that supports colour temperature to 2700 K.",
   },
 ];
 
 export const CATALOG_TAGS: Record<string, string> = {
-  "vgi.title": "VGI Starter Worker",
+  "vgi.title": "VGI Hue Worker",
   "vgi.doc_llm": CATALOG_DOC_LLM,
   "vgi.doc_md": CATALOG_DOC_MD,
   "vgi.source_url": SOURCE_URL,
@@ -130,7 +146,7 @@ export const CATALOG_TAGS: Record<string, string> = {
   "vgi.license": "0BSD",
   "vgi.author": "Query.Farm",
   "vgi.copyright": "Copyright 2026 Query.Farm LLC",
-  "vgi.keywords": keywordsArray("vgi, duckdb, starter template, example worker, rest api, table function"),
+  "vgi.keywords": keywordsArray("philips hue, smart home, lights, home automation, sensors, duckdb, vgi"),
   "vgi.support_contact": `${SOURCE_URL}/issues`,
   "vgi.support_policy_url": `${SOURCE_URL}#support`,
   // Public analyst tasks for `vgi-lint simulate`; private graders live in vgi-agent-tests.yaml.
@@ -138,9 +154,9 @@ export const CATALOG_TAGS: Record<string, string> = {
 };
 
 export const SCHEMA_TAGS: Record<string, string> = {
-  "vgi.title": "Starter Functions",
-  domain: "examples",
-  "vgi.keywords": keywordsArray("greeting, sequence, generator, rest api, pagination"),
+  "vgi.title": "Hue Functions",
+  domain: "smart home",
+  "vgi.keywords": keywordsArray("hue, lights, rooms, scenes, sensors, light control"),
   "vgi.doc_llm": SCHEMA_DOC_LLM,
   "vgi.doc_md": SCHEMA_DOC_MD,
   "vgi.categories": JSON.stringify(SCHEMA_CATEGORIES),

@@ -19,7 +19,7 @@ concurrency:
 jobs:
   ci:
     # The template repositories themselves publish no image; forks do.
-    if: ${{ !startsWith(github.repository, 'Query-farm/vgi-starter-') }}
+    if: ${{ !startsWith(github.repository, 'Query-farm/vgi-hue-') }}
     uses: ./.github/workflows/ci.yml
 
   publish:
@@ -32,7 +32,7 @@ jobs:
     uses: Query-farm/vgi-actions/.github/workflows/docker-publish.yml@v1
     secrets: inherit
     with:
-      image_name: vgi-starter-worker
+      image_name: vgi-hue-worker
       # Nothing to language-import in a Bun image; the /health boot smoke still runs.
       smoke_import: ""
       health_port: "8000"

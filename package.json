@@ -2,7 +2,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A VGI worker for DuckDB, generated from the Query.Farm VGI starter template.",
+  "description": "A VGI worker that reads and controls Philips Hue lights from DuckDB.",
   "license": "0BSD",
   "scripts": {
     "typecheck": "tsc --noEmit",

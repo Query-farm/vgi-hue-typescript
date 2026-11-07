@@ -10,8 +10,9 @@
  * SDK's `serveVgiWorker`, which also answers `GET /health`.
  */
 
-import { type CatalogDescriptor, FunctionRegistry, ReadOnlyCatalogInterface, Worker } from "@query-farm/vgi";
+import { type CatalogDescriptor, FunctionRegistry, Worker } from "@query-farm/vgi";
 import { serveVgiWorker } from "@query-farm/vgi/serve";
+import { HueCatalogInterface } from "./attach.ts";
 import { log, parseLevel, setLogLevel } from "./log.ts";
 
 const HELP = `usage: <worker> [--http [--host HOST] [--port PORT]] [--unix PATH] [--debug | --log-level LEVEL]
@@ -107,8 +108,11 @@ export function serve(
   const registry = new FunctionRegistry();
   for (const schema of catalog.schemas) {
     for (const fn of schema.functions ?? []) registry.register(fn);
+    // Tables are served by scan functions that are not listed in `functions`.
+    for (const table of schema.tables ?? []) if (table.function) registry.register(table.function);
   }
-  const catalogInterface = new ReadOnlyCatalogInterface(catalog, registry);
+  // Adds the `bridge` / `app_key` ATTACH options to the descriptor catalog.
+  const catalogInterface = new HueCatalogInterface(catalog, registry);
 
   if (!args.http) {
     log.debug(`serving catalog ${catalog.name} (${args.rest.includes("--unix") ? "unix socket" : "stdio"})`);

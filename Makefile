@@ -5,25 +5,17 @@ HAYBARN_VERSION ?= 2.0.0rc11
 # vgi-lint is deliberately not pinned: the gate tracks the current quality bar.
 VGI_LINT        := uvx --prerelease=allow --from 'vgi-lint-check>=2,<3' vgi-lint lint
 LINT_ARGS       ?=
-WORKER          := $(CURDIR)/bin/vgi-starter-worker
+WORKER          := $(CURDIR)/bin/vgi-hue-worker
 TOOLS           := $(CURDIR)/.tools
 HAYBARN_UNITTEST := $(TOOLS)/bin/haybarn-unittest
 TRANSPORT       ?= stdio
 
 .DEFAULT_GOAL := help
-.PHONY: help build test test-unit test-sql test-sql-all lint lint-explain lint-ai fmt check run run-http debug tools template-diff clean
-# template-only:start
-.PHONY: init
-# template-only:end
+.PHONY: pair help build test test-unit test-sql test-sql-all lint lint-explain lint-ai fmt check run run-http debug tools template-diff clean
 
 help: ## List the targets
 	@awk 'BEGIN{FS=":.*## "} /^[a-zA-Z_-]+:.*## /{printf "  %-14s %s\n",$$1,$$2}' $(MAKEFILE_LIST)
 
-# template-only:start
-init: ## Rename this template: make init NAME=weather
-	@test -n "$(NAME)" || { echo "usage: make init NAME=<snake_case_name>"; exit 2; }
-	uv run --no-project python scripts/vgi_template.py init $(NAME)
-# template-only:end
 
 build: ## Install the worker's dependencies into node_modules
 	bun install --frozen-lockfile
@@ -51,8 +43,8 @@ test-sql-all: ## SQL tests over every transport
 
 test: test-unit test-sql ## Unit + SQL tests
 
-lint-explain: build ## Metadata quality report (vgi-lint, settings in vgi-lint.toml). LINT_ARGS="--format agent" for agents
-	$(VGI_LINT) "$(WORKER)" $(LINT_ARGS)
+lint-explain: build ## Metadata quality report against the mock bridge (vgi-lint, settings in vgi-lint.toml). LINT_ARGS="--format agent" for agents
+	PYTHON="uv run --no-project python" ci/lint.sh $(VGI_LINT) "$(WORKER)" $(LINT_ARGS)
 
 lint-ai: ## Opt-in L3 check: an agent runs vgi-agent-tests.yaml and docs are reviewed (needs the claude CLI)
 	@$(MAKE) --no-print-directory lint-explain LINT_ARGS="--ai $(LINT_ARGS)"
@@ -65,8 +57,11 @@ run: build ## Serve over stdio (what DuckDB launches)
 run-http: build ## Serve over HTTP on port 8000
 	$(WORKER) --http --host 127.0.0.1 --port 8000
 
+pair: build ## Create a Hue app key: press the bridge's link button when asked (saved to ~/.config/vgi-hue/app_key)
+	bun run src/pair.ts $(PAIR_ARGS)
+
 debug: build tools ## Run one query against the worker with debug logging on stderr
-	@printf "LOAD vgi;\nATTACH 'starter' (TYPE vgi, LOCATION '$(WORKER) --debug');\nSELECT starter.main.greet('debug');\n" \
+	@printf "LOAD vgi;\nATTACH 'hue' (TYPE vgi, LOCATION '$(WORKER) --debug', app_key '$$HUE_APP_KEY');\nSELECT name, is_on, brightness FROM hue.main.lights;\n" \
 	  | uvx --from haybarn-cli==$(HAYBARN_VERSION) haybarn -no-agent
 
 template-diff: ## Show upstream template changes since this project was created

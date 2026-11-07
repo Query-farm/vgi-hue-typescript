@@ -6,9 +6,9 @@ FROM oven/bun:1.3-slim
 
 ARG VERSION=0.0.0
 ARG GIT_COMMIT=unknown
-LABEL org.opencontainers.image.title="vgi-starter-worker" \
+LABEL org.opencontainers.image.title="vgi-hue-worker" \
       org.opencontainers.image.description="A VGI worker for DuckDB" \
-      org.opencontainers.image.source="https://github.com/Query-farm/vgi-starter-typescript" \
+      org.opencontainers.image.source="https://github.com/your-org/vgi-hue" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${GIT_COMMIT}" \
       org.opencontainers.image.licenses="0BSD"

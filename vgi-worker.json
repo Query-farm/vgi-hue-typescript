@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "catalog": "hue",
+  "worker": ["bin/vgi-hue-worker"],
+  "checks": [
+    {
+      "name": "lights table (bridge from HUE_BRIDGE / HUE_APP_KEY)",
+      "sql": "SELECT name, room, is_on, brightness, color_temperature_kelvin FROM hue.main.lights ORDER BY name",
+      "columns": ["name", "room", "is_on", "brightness", "color_temperature_kelvin"],
+      "rows": [
+        ["Desk lamp", "Living room", true, 100.0, 4000],
+        ["Kitchen ceiling", "Kitchen", true, 80.0, 2703],
+        ["Kitchen pendant", "Kitchen", true, 50.0, null],
+        ["Sofa lamp", "Living room", false, 30.0, null]
+      ]
+    },
+    {
+      "name": "rooms and zones",
+      "sql": "SELECT name, kind, light_count FROM hue.main.rooms ORDER BY kind, name",
+      "rows": [["Hallway", "room", 0], ["Kitchen", "room", 2], ["Living room", "room", 2], ["Downstairs", "zone", 2]]
+    },
+    {
+      "name": "warmest room from sensors",
+      "sql": "SELECT room, temperature_c FROM hue.main.sensors WHERE kind = 'temperature' ORDER BY temperature_c DESC LIMIT 1",
+      "rows": [["Kitchen", 23.25]]
+    },
+    {
+      "name": "set_room changes state",
+      "sql": "SELECT target_type, name, ok FROM hue.main.set_room('Kitchen', power := false)",
+      "rows": [["room", "Kitchen", true]]
+    },
+    {
+      "name": "bulk set_lights from a query",
+      "sql": "SELECT target_id, ok FROM hue.main.set_lights((SELECT light_id FROM hue.main.lights WHERE color_mode IS NOT NULL), kelvin := 2700) ORDER BY target_id",
+      "rows": [["l-ceiling", true], ["l-desk", true], ["l-sofa", true]]
+    },
+    {
+      "name": "recall_scene",
+      "sql": "SELECT target_id FROM hue.main.recall_scene('Relax', room := 'Living room')",
+      "rows": [["s-relax-living"]]
+    }
+  ]
+}

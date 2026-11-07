@@ -4,13 +4,10 @@
 # contract with `vgi-lint spec`.
 
 # The worker to attach, relative to this directory. Build it first with `make build`.
-location = "bin/vgi-starter-worker"
+location = "bin/vgi-hue-worker"
 
-# template-only:start
-fail_on = "info"
-# template-only:end
 # Fail on warnings while you build. Raise this to "info" before you publish the worker.
-# fork-only: fail_on = "warning"
+fail_on = "warning"
 
 # Waive a finding only with a kind and a reason, so the waiver can be audited:
 #   domain-exemption  permanent and legitimate for this worker
