@@ -540,6 +540,6 @@ describe("transactions", () => {
     expect(stageable(false, id)).toBeNull();
     expect(stageable(true, null)).toBeNull();
     expect(stageable(true, id)).toBe(id);
-    expect(() => stageable(true, new Uint8Array(73))).toThrow(/local transports only/);
+    expect(() => stageable(true, new Uint8Array(73))).toThrow(/0.48.4 or later/);
   });
 });

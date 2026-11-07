@@ -22,9 +22,10 @@
  *
  * Staged requests live in a small SQLite file shared by the worker's
  * processes (DuckDB may route the statements of one transaction to different
- * worker processes). Over HTTP the SDK hands functions the transaction id
- * still sealed, so a function cannot match it to the commit; transactional
- * mode is refused there (see `stageable`).
+ * worker processes), so an HTTP deployment needs its workers on one host.
+ * Functions see the same plaintext transaction id as the commit hook from
+ * @query-farm/vgi 0.48.4 on (earlier SDKs passed it sealed over HTTP; see
+ * `stageable`).
  */
 
 import { Database } from "bun:sqlite";
@@ -97,9 +98,10 @@ export function beginTransaction(): Uint8Array {
 export function stageable(transactional: boolean, txId: Uint8Array | null | undefined): Uint8Array | null {
   if (!transactional || txId == null || txId.length === 0) return null;
   if (txId.length !== TX_ID_BYTES) {
+    // A sealed envelope: the SDK predates function-side unsealing (0.48.4).
     throw new HueError(
-      "transactional mode works over the local transports only (stdio / launch): over HTTP the " +
-        "transaction id reaches functions sealed. Attach without `transactional` to apply changes at once.",
+      "transactional mode needs @query-farm/vgi 0.48.4 or later over HTTP: this worker received the " +
+        "transaction id sealed. Attach without `transactional` to apply changes at once.",
     );
   }
   return txId;

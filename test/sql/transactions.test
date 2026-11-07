@@ -8,9 +8,6 @@ require-env HUE_WORKER
 
 require-env HUE_MOCK_BRIDGE
 
-# Transaction ids reach functions sealed over HTTP: local transports only.
-require-env HUE_LOCAL_TRANSPORT
-
 # `bridge` shows what the bridge really holds; `tx` stages its changes.
 statement ok
 ATTACH 'hue' AS bridge (TYPE vgi, LOCATION '{HUE_WORKER}', bridge '{HUE_MOCK_BRIDGE}', app_key 'test-key');

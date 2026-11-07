@@ -84,12 +84,10 @@ export HUE_TX_DIR="$STAGE/tx"
 
 HTTP=0
 case "$TRANSPORT" in
-  stdio)  export HUE_WORKER="$WORKER"; export HUE_LOCAL_TRANSPORT=1 ;;
-  launch) export HUE_WORKER="launch:$WORKER"; export HUE_LOCAL_TRANSPORT=1 ;;
+  stdio)  export HUE_WORKER="$WORKER" ;;
+  launch) export HUE_WORKER="launch:$WORKER" ;;
   http)
     HTTP=1
-    # Transactional attaches are local-transport only (transactions.test gates on it).
-    EXPECTED_SKIP_REASONS="${EXPECTED_SKIP_REASONS:+$EXPECTED_SKIP_REASONS$'\n'}require-env HUE_LOCAL_TRANSPORT"
     start_server "$STAGE/worker.log" "$WORKER" --http --port 0
     export HUE_WORKER="http://127.0.0.1:$PORT"
     ;;

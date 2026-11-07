@@ -41,7 +41,7 @@ export const ATTACH_OPTIONS: AttachOptionSpec[] = [
     name: "transactional",
     description:
       "Stage light changes (UPDATE and the control functions) in DuckDB transactions and send " +
-      "them at COMMIT; ROLLBACK discards them. Local transports (stdio / launch) only. Default " +
+      "them at COMMIT; ROLLBACK discards them. Default " +
       "false: every change is sent as its statement runs.",
     type: bool,
     default: false,

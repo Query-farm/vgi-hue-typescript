@@ -141,8 +141,8 @@ COMMIT;      -- everything is sent now, back to back
   commits, right after it runs, and a bridge refusal fails that statement. In a transactional
   attach, `set_room`'s `wait_ms` has nothing to wait for (`settled` is NULL), and `set_lights`
   reports bridge refusals at commit, not per row.
-- Local transports only (DuckDB starting the worker, or `launch:`). Over HTTP the SDK hands
-  functions the transaction id still encrypted, so the worker refuses transactional mode there.
+- Works on every transport. Over HTTP, staged changes live in a file on the worker's host, so
+  run the HTTP workers for one bridge on a single host.
 
 Without `transactional`, every change is sent as its statement runs, which is the default.
 
