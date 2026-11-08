@@ -21,6 +21,12 @@
 #                     when set, examples/test/*.test run too (stdio/launch only)
 #   KEEP_STAGE=1      keep the staged test tree for debugging
 #
+# Isolation: every test file runs against its own fresh mock bridge (and, on
+# the http lane, its own fresh worker; on the launch lane, its own launcher
+# pool), with its own discovery cache and transaction directory. A file that
+# leaves the bridge changed -- transactions.test COMMITs real light changes --
+# therefore cannot break the files that run after it, in any order.
+#
 # Transports:
 #   stdio   DuckDB spawns the worker and talks over stdin/stdout (the default).
 #   launch  DuckDB starts the worker once on an AF_UNIX socket and pools
@@ -67,32 +73,51 @@ start_server() {
   echo "::error::'$*' never printed PORT:<n>"; cat "$log"; return 1
 }
 
-# The mock Hue bridge the SQL tests attach to. It answers the first GET of
-# every path with 429 + Retry-After so the retry path is always exercised.
 # Clear any real bridge settings so a developer's environment cannot leak in.
 unset HUE_BRIDGE HUE_APP_KEY
-MOCK_FLAKY=1 start_server "$STAGE/mock.log" $PYTHON "$REPO/test/mock_bridge/server.py"
-export HUE_MOCK_BRIDGE="http://127.0.0.1:$PORT"
-# Bridge discovery (ATTACH without `bridge`) goes to the mock's stand-in for
-# discovery.meethue.com only: no mDNS on the real LAN, and a throwaway cache.
-export HUE_DISCOVERY_URL="$HUE_MOCK_BRIDGE/discovery"
-export HUE_DISCOVERY_SCHEME=http
-export HUE_DISCOVERY_MDNS=off
-export XDG_CACHE_HOME="$STAGE/cache"
-# Staged transaction requests go to a throwaway directory too.
-export HUE_TX_DIR="$STAGE/tx"
-
-HTTP=0
 case "$TRANSPORT" in
-  stdio)  export HUE_WORKER="$WORKER" ;;
-  launch) export HUE_WORKER="launch:$WORKER" ;;
-  http)
-    HTTP=1
-    start_server "$STAGE/worker.log" "$WORKER" --http --port 0
-    export HUE_WORKER="http://127.0.0.1:$PORT"
-    ;;
+  stdio | launch) HTTP=0 ;;
+  http) HTTP=1 ;;
   *) echo "::error::unknown TRANSPORT=$TRANSPORT (expected stdio|launch|http)"; exit 1 ;;
 esac
+
+# start_fixtures <dir> <n> — a fresh mock Hue bridge for one test file (and,
+# over HTTP, a fresh worker), with throwaway state; exports what the tests and
+# the worker read. The mock answers the first GET of every path with 429 +
+# Retry-After so the retry path is always exercised.
+start_fixtures() {
+  local dir="$1" n="$2"
+  mkdir -p "$dir"
+  MOCK_FLAKY=1 start_server "$dir/mock.log" $PYTHON "$REPO/test/mock_bridge/server.py"
+  export HUE_MOCK_BRIDGE="http://127.0.0.1:$PORT"
+  # Bridge discovery (ATTACH without `bridge`) goes to the mock's stand-in for
+  # discovery.meethue.com only: no mDNS on the real LAN, and a throwaway cache.
+  export HUE_DISCOVERY_URL="$HUE_MOCK_BRIDGE/discovery"
+  export HUE_DISCOVERY_SCHEME=http
+  export HUE_DISCOVERY_MDNS=off
+  export XDG_CACHE_HOME="$dir/cache"
+  # Staged transaction requests go to a throwaway directory too.
+  export HUE_TX_DIR="$dir/tx"
+  # The launcher pools workers by (argv, cwd, VGI_RPC_* env): a per-file value
+  # gives each file its own worker processes, started with this file's env.
+  export VGI_RPC_HUE_TEST_FILE="$n"
+  case "$TRANSPORT" in
+    stdio)  export HUE_WORKER="$WORKER" ;;
+    launch) export HUE_WORKER="launch:$WORKER" ;;
+    http)
+      start_server "$dir/worker.log" "$WORKER" --http --port 0
+      WORKER_PID="${PIDS[${#PIDS[@]}-1]}"
+      export HUE_WORKER="http://127.0.0.1:$PORT"
+      ;;
+  esac
+}
+
+# stop_fixtures — stop this file's mock (and worker); keep the PIDS list for cleanup.
+stop_fixtures() {
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do wait "$p" 2>/dev/null || true; done
+  PIDS=()
+}
 
 # Stage the tests, rewriting `require vgi` into a signed INSTALL + LOAD (the
 # standalone runner links no extensions) and loading httpfs for HTTP workers.
@@ -130,22 +155,40 @@ cat > "$STAGE/no_error_skip.json" <<'EOF'
 {"skip_error_messages": ["__vgi_hue_never_matches__"]}
 EOF
 
-echo "Running test/sql over $TRANSPORT (worker: $HUE_WORKER)"
+echo "Running test/sql over $TRANSPORT, one fresh mock bridge per file"
 LOG="$STAGE/unittest.log"
+: > "$LOG"
 rc=0
-( cd "$STAGE" && "$HAYBARN_UNITTEST" --keep-home --test-dir "$STAGE" \
-    --test-config "$STAGE/no_error_skip.json" "test/sql/*" ) 2>&1 | tee "$LOG" && rc=0 || rc="${PIPESTATUS[0]}"
+n=0
+for staged in "$STAGE"/test/sql/*.test; do
+  n=$((n + 1))
+  name="$(basename "$staged")"
+  fixtures="$STAGE/fixtures/$n"
+  start_fixtures "$fixtures" "$n"
+  echo "== $name (worker: $HUE_WORKER, bridge: $HUE_MOCK_BRIDGE)"
+  file_rc=0
+  ( cd "$STAGE" && "$HAYBARN_UNITTEST" --keep-home --test-dir "$STAGE" \
+      --test-config "$STAGE/no_error_skip.json" "test/sql/$name" ) 2>&1 | tee "$fixtures/unittest.log" \
+    && file_rc=0 || file_rc="${PIPESTATUS[0]}"
+  cat "$fixtures/unittest.log" >> "$LOG"
+  [ "$file_rc" = "0" ] || { echo "::error::$name failed over $TRANSPORT"; rc=1; }
+  if [ "$HTTP" = "1" ] && ! kill -0 "$WORKER_PID" 2>/dev/null; then
+    echo "::error::the HTTP worker died during $name:"; cat "$fixtures/worker.log"; rc=1
+  fi
+  stop_fixtures
+done
 
 if grep -q 'No test cases matched\|No tests ran' "$LOG"; then
   echo "::error::no test cases matched; the staging is wrong"; exit 1
 fi
-total="$(sed -n 's/^\[[0-9]*\/\([0-9]*\)\].*/\1/p' "$LOG" | tail -1)"
+# Each file's log reports [i/1]; count the files, then subtract skips.
+total="$(grep -c '^\[1/1\]' "$LOG" || true)"
 total="${total:-0}"
 skips="$(awk '/^Skipped tests for the following reasons:/{b=1;next} b&&/^[[:space:]]*$/{b=0} b&&match($0,/: [0-9]+[[:space:]]*$/){print substr($0,1,RSTART-1) "\t" substr($0,RSTART+2)+0}' "$LOG")"
 skipped=0
-while IFS=$'\t' read -r reason n; do
+while IFS=$'\t' read -r reason count; do
   [ -n "$reason" ] || continue
-  skipped=$((skipped + n))
+  skipped=$((skipped + count))
   if ! printf '%s\n' "${EXPECTED_SKIP_REASONS:-}" | grep -qxF "$reason"; then
     echo "::error::unexpected skip: '$reason'. A test file silently stopped running;" \
          "fix the gate or add it to EXPECTED_SKIP_REASONS."
@@ -156,8 +199,5 @@ executed=$((total - skipped))
 echo "executed $executed of $total test files over $TRANSPORT ($skipped skipped)"
 if [ "$executed" -lt "$MIN_EXECUTED" ]; then
   echo "::error::only $executed test files ran (MIN_EXECUTED=$MIN_EXECUTED)"; rc=1
-fi
-if [ "$HTTP" = "1" ] && ! kill -0 "${PIDS[1]}" 2>/dev/null; then
-  echo "::error::the HTTP worker died during the run:"; cat "$STAGE/worker.log"; rc=1
 fi
 exit "$rc"

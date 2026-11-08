@@ -4,9 +4,20 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Arguments, batchFromColumns, bool, field, float64, int64, schema, utf8, VgiClient } from "@query-farm/vgi";
+import {
+  Arguments,
+  AttachOptionsUnavailableError,
+  batchFromColumns,
+  bool,
+  field,
+  float64,
+  int64,
+  schema,
+  utf8,
+  VgiClient,
+} from "@query-farm/vgi";
 import { subprocessConnect } from "@query-farm/vgi-rpc";
-import { decodeAttachOptions, encodeAttachOptions } from "../src/attach.ts";
+import { bridgeOptionsFrom, decodeAttachOptions } from "../src/attach.ts";
 import { lightReflects, matchByIdOrName, recallScene, setLight, setRoom } from "../src/control.ts";
 import { candidateUrl, chooseBridge, discoverBridge, isBridgeId, mdnsQuery } from "../src/discovery.ts";
 import {
@@ -63,12 +74,19 @@ describe("connection settings", () => {
     expect(seen).toEqual([null, "001788FFFE00BEEF"]);
   });
 
-  test("attach options round-trip through attach_opaque_data", () => {
-    const bytes = encodeAttachOptions({ bridge: " 1.2.3.4 ", app_key: "k", other: 5 });
-    expect(decodeAttachOptions(bytes)).toEqual({ bridge: "1.2.3.4", app_key: "k" });
-    expect(decodeAttachOptions(encodeAttachOptions(undefined))).toEqual({});
-    expect(decodeAttachOptions(new Uint8Array([1, 2, 3]))).toEqual({});
+  test("bridge options come from the ATTACH options (trimmed, blanks dropped)", () => {
+    expect(bridgeOptionsFrom({ bridge: " 1.2.3.4 ", app_key: "k", other: 5 })).toEqual({
+      bridge: "1.2.3.4",
+      app_key: "k",
+    });
+    expect(bridgeOptionsFrom({ bridge: "  ", transactional: true })).toEqual({ transactional: true });
+    expect(bridgeOptionsFrom(undefined)).toEqual({});
+    // No attach (a call outside one): no options.
     expect(decodeAttachOptions(null)).toEqual({});
+  });
+
+  test("attach bytes the SDK did not hand out are refused, not read as options", () => {
+    expect(() => decodeAttachOptions(new Uint8Array([1, 2, 3]))).toThrow(AttachOptionsUnavailableError);
   });
 });
 

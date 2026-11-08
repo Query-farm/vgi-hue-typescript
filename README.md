@@ -190,7 +190,7 @@ SELECT name, ok FROM hue.main.set_lights(
 src/
   worker.ts      # entry point: stdio / --unix / --http
   cli.ts         # flag parsing; uses HueCatalogInterface
-  attach.ts      # bridge / app_key ATTACH options -> attach_opaque_data
+  attach.ts      # bridge / app_key ATTACH options, read via the SDK's attachOptions()
   discovery.ts   # find the bridge: cache, mDNS, discovery.meethue.com
   hue.ts         # CLIP v2 client (retries, pacing), colour math, request bodies
   inventory.ts   # lights / rooms / scenes / sensors tables
@@ -209,10 +209,13 @@ ci/lint.sh                   # vgi-lint against the mock bridge
 
 ### How the ATTACH options reach the functions
 
-`HueCatalogInterface` (in `attach.ts`) declares `bridge` and `app_key` as attach options.
-When you attach, it packs them into the catalog's `attach_opaque_data`, which DuckDB sends
-back on every call. Over HTTP the SDK seals those bytes in an encrypted envelope bound to the
-caller. Binding never contacts the bridge, so `DESCRIBE` and planning work offline.
+`HueCatalogInterface` (in `attach.ts`) declares `bridge` and `app_key` as attach options
+(`app_key` secret). Functions and the transaction hooks read them with the SDK's
+`attachOptions()`: the SDK carries the options inside `attach_opaque_data`, which DuckDB sends
+back on every call, and encrypts the secret `app_key` with a worker-held key, so the app key is
+never in plaintext in any opaque value on any transport (over HTTP the whole value is sealed
+too). The worker never packs options into its own attach bytes. Binding never contacts the
+bridge, so `DESCRIBE` and planning work offline.
 
 ## Testing
 

@@ -5,17 +5,25 @@
  *                 bridge '192.168.1.20', app_key getenv('HUE_APP_KEY'));
  *
  * The catalog advertises both options so DuckDB validates them (and redacts
- * `app_key`, declared secret). At attach time the worker packs the supplied
- * values into the catalog's `attach_opaque_data`, which DuckDB hands back on
- * every function call. Over HTTP the SDK seals those bytes in an
- * authenticated-encrypted envelope bound to the caller; over stdio/unix they
- * never leave the worker's own process pair. Either option may be omitted,
+ * `app_key`, declared secret). Functions and the transaction hooks read them
+ * with the SDK's `attachOptions()`: the SDK carries the options inside
+ * `attach_opaque_data` itself and encrypts the secret `app_key` with a
+ * worker-held key, so the app key is never in plaintext in any opaque value
+ * on any transport, and this worker never packs options into its own attach
+ * bytes. Either option may be omitted,
  * in which case the worker falls back to `HUE_BRIDGE` / `HUE_APP_KEY` from
  * its environment, and with no bridge at all it discovers one on the LAN
  * (see `resolveConnection` in hue.ts and discovery.ts).
  */
 
-import { type AttachOptionSpec, bool, type CatalogAttachResult, ReadOnlyCatalogInterface, utf8 } from "@query-farm/vgi";
+import {
+  type AttachOptionSpec,
+  attachOptions,
+  bool,
+  type CatalogAttachResult,
+  ReadOnlyCatalogInterface,
+  utf8,
+} from "@query-farm/vgi";
 import { type BridgeConnection, type BridgeOptions, resolveConnection } from "./hue.ts";
 import { beginTransaction, commitTransaction, rollbackTransaction } from "./transactions.ts";
 
@@ -48,31 +56,25 @@ export const ATTACH_OPTIONS: AttachOptionSpec[] = [
   },
 ];
 
-const MAGIC = "hue1:";
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-
-/** Pack the supplied ATTACH options into attach_opaque_data bytes. */
-export function encodeAttachOptions(options: Record<string, unknown> | undefined): Uint8Array {
+/** The bridge options among the supplied ATTACH options (trimmed; blanks dropped). */
+export function bridgeOptionsFrom(options: Readonly<Record<string, unknown>> | undefined): BridgeOptions {
   const out: BridgeOptions = {};
   for (const key of ["bridge", "app_key"] as const) {
     const value = options?.[key];
     if (typeof value === "string" && value.trim()) out[key] = value.trim();
   }
   if (options?.transactional === true) out.transactional = true;
-  return encoder.encode(MAGIC + JSON.stringify(out));
+  return out;
 }
 
-/** Unpack attach_opaque_data; anything unrecognised means "no options". */
+/**
+ * The ATTACH options of the attach a call or hook belongs to, read through the
+ * SDK's accessor from the attach bytes it handed us. No attach (a call outside
+ * one) means "no options".
+ */
 export function decodeAttachOptions(bytes: Uint8Array | null | undefined): BridgeOptions {
-  if (!bytes || bytes.length === 0) return {};
-  const text = decoder.decode(bytes);
-  if (!text.startsWith(MAGIC)) return {};
-  try {
-    return JSON.parse(text.slice(MAGIC.length)) as BridgeOptions;
-  } catch {
-    return {};
-  }
+  if (!bytes) return {};
+  return bridgeOptionsFrom(attachOptions(bytes));
 }
 
 /** The bridge connection for a function call, from its bind request. */
@@ -89,10 +91,11 @@ export class HueCatalogInterface extends ReadOnlyCatalogInterface {
     implementationVersion?: string | null,
     clientCapabilities?: Uint8Array | null,
   ): Promise<CatalogAttachResult> {
+    // The attach bytes stay the SDK's random per-attach id: the options reach
+    // functions and hooks through attachOptions(), app_key encrypted.
     const result = await super.attach(name, options, dataVersionSpec, implementationVersion, clientCapabilities);
     return {
       ...result,
-      attach_opaque_data: encodeAttachOptions(options),
       // Only a transactional attach asks DuckDB for begin/commit/rollback.
       supports_transactions: options?.transactional === true,
     };

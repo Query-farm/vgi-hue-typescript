@@ -25,7 +25,7 @@ src/
   worker.ts        # entry point: serves the catalog over stdio, --unix or --http
   catalog.ts       # assembles the catalog; add new functions to FUNCTIONS
   meta.ts          # catalog/schema metadata + helpers (objectTags, column)
-  attach.ts        # bridge / app_key ATTACH options -> attach_opaque_data (HueCatalogInterface)
+  attach.ts        # bridge / app_key ATTACH options via the SDK's attachOptions() (HueCatalogInterface)
   discovery.ts     # bridge discovery: cache, mDNS, discovery.meethue.com
   hue.ts           # Hue CLIP v2 client (retries, pacing), colour math, PUT bodies
   inventory.ts     # lights / rooms / scenes / sensors catalog tables (scan functions)
@@ -127,7 +127,7 @@ Recipes for most kinds are in `examples/`.
 - **Examples must be deterministic.** Add `ORDER BY`, and no `now()`, random values or
   network. Examples that hit a live API go in `examples`, not `executable_examples`.
 - **Credentials.** The bridge key arrives as the secret `app_key` ATTACH option (falling
-  back to `HUE_APP_KEY`). Never put them in logs, examples or the repo, and
+  back to `HUE_APP_KEY`); read it with `attachOptions()`, never pack it into attach bytes. Never put them in logs, examples or the repo, and
   keep them out of table-function state unless the state rule above says
   the SDK encrypts it. Workers that need real credentials set `execute: false` on the metadata check.
 - **Errors.** Raise errors with a clear message. For HTTP failures, include the status
