@@ -61,7 +61,7 @@ pair: build ## Create a Hue app key: press the bridge's link button when asked (
 	bun run src/pair.ts $(PAIR_ARGS)
 
 debug: build tools ## Run one query against the worker with debug logging on stderr
-	@printf "LOAD vgi;\nATTACH 'hue' (TYPE vgi, LOCATION '$(WORKER) --debug', app_key '$$HUE_APP_KEY');\nSELECT name, is_on, brightness FROM hue.main.lights;\n" \
+	@printf "LOAD vgi;\nATTACH 'hue' (TYPE vgi, LOCATION '$(WORKER) --debug', app_key getenv('HUE_APP_KEY'));\nSELECT name, is_on, brightness FROM hue.main.lights;\n" \
 	  | uvx --from haybarn-cli==$(HAYBARN_VERSION) haybarn -no-agent
 
 template-diff: ## Show upstream template changes since this project was created
