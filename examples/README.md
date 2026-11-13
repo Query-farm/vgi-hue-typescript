@@ -14,8 +14,9 @@ main worker.
 | `catalog_tables` | a dataset queried by name, with a primary key | `SELECT * FROM catalog_tables.main.countries` |
 | `copy_to_sink` | `COPY … TO` with a custom output format | `COPY t TO 'out.jsonl' (FORMAT 'copy_to_sink.jsonl_out')` |
 
-Streaming large results and calling REST APIs are covered by the main worker's
-`sequence_table` and `fetch_items`.
+Calling a REST API, streaming live rows and writing back with `UPDATE` are covered
+by the main worker itself: the `hue` catalog's `lights`, `rooms`, `scenes` and
+`sensors` tables and its `set_*` functions.
 
 ## Running a recipe
 
