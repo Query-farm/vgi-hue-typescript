@@ -30,8 +30,8 @@
 
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { tmpdir, userInfo } from "node:os";
+import { join, resolve } from "node:path";
 import {
   type BridgeConnection,
   getResources,
@@ -59,21 +59,100 @@ export interface StagedRequest {
   body: Record<string, unknown>;
 }
 
+/**
+ * Per-user directory: the default sits under the OS temp dir (per-user %TEMP% on
+ * Windows) in a folder named for the user, so two users never share one store
+ * and every process of one user resolves the same file (and the same -wal/-shm).
+ */
 function dbPath(env: Record<string, string | undefined> = process.env): string {
-  const dir = env.HUE_TX_DIR || join(tmpdir(), "vgi-hue");
+  let user = "user";
+  try {
+    user = userInfo().username.replace(/[^A-Za-z0-9._-]/g, "_") || user;
+  } catch {
+    // no passwd entry: fall back to a fixed name
+  }
+  const dir = resolve(env.HUE_TX_DIR || join(tmpdir(), `vgi-hue-${user}`));
   mkdirSync(dir, { recursive: true });
   return join(dir, "transactions.db");
 }
 
-function open(): Database {
-  const db = new Database(dbPath(), { create: true });
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA busy_timeout = 5000");
-  db.exec(
-    "CREATE TABLE IF NOT EXISTS staged (seq INTEGER PRIMARY KEY AUTOINCREMENT, tx TEXT NOT NULL, " +
-      "kind TEXT NOT NULL, target TEXT NOT NULL, body TEXT NOT NULL, created REAL NOT NULL)",
-  );
-  db.exec("CREATE INDEX IF NOT EXISTS staged_tx ON staged (tx, seq)");
+/** Total time the WAL switch / schema setup may spend retrying. */
+const SETUP_BUDGET_MS = 30_000;
+
+/**
+ * Errors worth retrying while several processes open a fresh database at once:
+ * SQLITE_BUSY / SQLITE_LOCKED (and extended codes), plus the transient I/O
+ * errors (e.g. SQLITE_IOERR_TRUNCATE, 1546) Windows reports while another
+ * process is creating the -shm file.
+ */
+export function isTransientSqliteError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: unknown; errno?: unknown; message?: unknown };
+  const code = typeof e.code === "string" ? e.code : "";
+  if (/^SQLITE_(BUSY|LOCKED|IOERR)/.test(code)) return true;
+  if (typeof e.errno === "number") {
+    const primary = e.errno & 0xff;
+    if (primary === 5 || primary === 6 || primary === 10) return true;
+  }
+  const msg = typeof e.message === "string" ? e.message : "";
+  return /database is locked|database table is locked|disk I\/O error/i.test(msg);
+}
+
+/** Runs `fn`, retrying transient SQLite errors with 5 ms → 100 ms backoff for up to ~30 s. */
+function withSetupRetry<T>(fn: () => T): T {
+  const deadline = Date.now() + SETUP_BUDGET_MS;
+  let delay = 5;
+  for (;;) {
+    try {
+      return fn();
+    } catch (err) {
+      if (!isTransientSqliteError(err) || Date.now() + delay > deadline) throw err;
+      Bun.sleepSync(delay);
+      delay = Math.min(delay * 2, 100);
+    }
+  }
+}
+
+const SCHEMA = [
+  "CREATE TABLE IF NOT EXISTS staged (seq INTEGER PRIMARY KEY AUTOINCREMENT, tx TEXT NOT NULL, " +
+    "kind TEXT NOT NULL, target TEXT NOT NULL, body TEXT NOT NULL, created REAL NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS staged_tx ON staged (tx, seq)",
+];
+
+/**
+ * Opens the staging store. Safe when many worker processes open a fresh file at
+ * once: busy_timeout is set before the WAL switch, the switch is retried on
+ * BUSY/LOCKED and transient I/O errors, and the schema is created inside
+ * BEGIN IMMEDIATE so only one process at a time runs it.
+ */
+export function open(path: string = dbPath()): Database {
+  const db = withSetupRetry(() => new Database(path, { create: true }));
+  try {
+    db.exec("PRAGMA busy_timeout = 5000");
+    withSetupRetry(() => {
+      const row = db.query("PRAGMA journal_mode = WAL").get() as { journal_mode?: string } | null;
+      if (row?.journal_mode?.toLowerCase() !== "wal") {
+        throw Object.assign(new Error(`journal_mode is ${row?.journal_mode}, not wal`), { code: "SQLITE_BUSY" });
+      }
+    });
+    withSetupRetry(() => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        for (const stmt of SCHEMA) db.exec(stmt);
+        db.exec("COMMIT");
+      } catch (err) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          // no transaction left to roll back
+        }
+        throw err;
+      }
+    });
+  } catch (err) {
+    db.close();
+    throw err;
+  }
   return db;
 }
 
