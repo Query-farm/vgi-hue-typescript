@@ -13,7 +13,10 @@ Home layout
                "Living room sensor" (motion sensor, disabled: its readings are
                stale, as a real bridge keeps them), "Hue tap dial switch"
                (battery only; its buttons are not read)
-* Hallway:     "Hallway sensor" (motion sensor), "Front door" (contact sensor)
+* Hallway:     "Hallway strip" (gradient lightstrip, off: 5 points capable,
+               10 pixels, three points set), "Hallway sensor" (motion sensor),
+               "Front door" (contact sensor)
+* Effects (candle, fire, ...) on the colour lights: Sofa lamp, Desk lamp, Hallway strip
 * Zone "Downstairs": Kitchen ceiling + Sofa lamp
 * Scenes: Relax (Kitchen), Bright (Kitchen), Relax (Living room)
 
@@ -28,6 +31,15 @@ Switches (environment):
 * ``MOCK_FLAKY=1``: the first GET of every path answers 429 + Retry-After: 0.
 * ``MOCK_GROUP_DELAY_MS``: apply grouped_light commands to the bulbs only after
   this delay, as a real bridge relays them over Zigbee one bulb at a time.
+* ``MOCK_LIGHT_DELAY_MS``: answer every light PUT only after this delay (the
+  bridge round trip), so tests can see whether requests overlap.
+* ``MOCK_EXTRA_LIGHTS=<n>``: add n colour lights "Bench 1".."Bench n"
+  (ids ``l-bench-1``..) in an extra room "Bench".
+* ``MOCK_FAIL_LIGHT=<id>``: light PUTs to that light answer HTTP 500.
+
+``GET /debug/puts`` lists every PUT so far as ``{path, body, start, end}``
+(``time.monotonic()`` seconds, ``end`` null while in flight); ``DELETE
+/debug/puts`` clears the list.
 
 Usage: ``python3 test/mock_bridge/server.py`` prints ``PORT:<n>`` once listening.
 """
@@ -41,9 +53,12 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_KEY = os.environ.get("MOCK_APP_KEY", "test-key")
+EFFECTS = ["no_effect", "candle", "fire", "prism", "sparkle", "opal", "glisten"]
+GRADIENT_MODES = ["interpolated_palette", "interpolated_palette_mirrored", "random_pixelated", "segmented_palette"]
 BRIDGE_ID = "001788FFFE00BEEF"
 
 
@@ -100,6 +115,7 @@ def initial_state() -> dict[str, list[dict]]:
         device("d-pendant", "Kitchen pendant", "LWB010", "Hue white lamp", [ref("l-pendant", "light")]),
         device("d-sofa", "Sofa lamp", "LCA001", "Hue color lamp", [ref("l-sofa", "light")]),
         device("d-desk", "Desk lamp", "LCA001", "Hue color lamp", [ref("l-desk", "light")]),
+        device("d-strip", "Hallway strip", "LCX004", "Hue gradient lightstrip", [ref("l-strip", "light")]),
         device("d-ksensor", "Kitchen sensor", "SML001", "Hue motion sensor", []),
         device("d-hsensor", "Hallway sensor", "SML001", "Hue motion sensor", []),
         device("d-door", "Front door", "SOC001", "Hue secure contact sensor", []),
@@ -111,9 +127,23 @@ def initial_state() -> dict[str, list[dict]]:
         light("l-pendant", "d-pendant", "Kitchen pendant", True, 50.0, None, None, "pendant_round"),
         light("l-sofa", "d-sofa", "Sofa lamp", False, 30.0, None, (0.5, 0.4), "floor_shade"),
         light("l-desk", "d-desk", "Desk lamp", True, 100.0, 250, (0.4, 0.38), "table_shade"),
+        light("l-strip", "d-strip", "Hallway strip", False, 60.0, None, (0.3, 0.3), "hue_lightstrip"),
     ]
+    lights[4]["gradient"] = {
+        "points": [{"color": {"xy": {"x": x, "y": y}}} for x, y in ((0.7006, 0.2993), (0.1724, 0.7468), (0.1355, 0.0399))],
+        "points_capable": 5,
+        "mode": "interpolated_palette",
+        "mode_values": list(GRADIENT_MODES),
+        "pixel_count": 10,
+    }
+    for l in lights[2:]:
+        l["effects"] = {"status": "no_effect", "status_values": list(EFFECTS), "effect_values": list(EFFECTS)}
     # The ceiling light is white ambiance: colour temperature but no xy colour.
     lights[0].pop("color", None)
+    extra = int(os.environ.get("MOCK_EXTRA_LIGHTS") or 0)
+    for n in range(1, extra + 1):
+        devices.append(device(f"d-bench-{n}", f"Bench {n}", "LCA001", "Hue color lamp", [ref(f"l-bench-{n}", "light")]))
+        lights.append(light(f"l-bench-{n}", f"d-bench-{n}", f"Bench {n}", False, 50.0, 300, (0.4, 0.4), "classic_bulb"))
     rooms = [
         {"id": "r-kitchen", "type": "room", "metadata": {"name": "Kitchen", "archetype": "kitchen"},
          "children": [ref("d-ceiling", "device"), ref("d-pendant", "device"), ref("d-ksensor", "device")],
@@ -122,9 +152,13 @@ def initial_state() -> dict[str, list[dict]]:
          "children": [ref("d-sofa", "device"), ref("d-desk", "device"), ref("d-lsensor", "device"), ref("d-dial", "device")],
          "services": [ref("gl-living", "grouped_light")]},
         {"id": "r-hallway", "type": "room", "metadata": {"name": "Hallway", "archetype": "hallway"},
-         "children": [ref("d-hsensor", "device"), ref("d-door", "device")],
+         "children": [ref("d-strip", "device"), ref("d-hsensor", "device"), ref("d-door", "device")],
          "services": [ref("gl-hallway", "grouped_light")]},
     ]
+    if extra:
+        rooms.append({"id": "r-bench", "type": "room", "metadata": {"name": "Bench", "archetype": "other"},
+                      "children": [ref(f"d-bench-{n}", "device") for n in range(1, extra + 1)],
+                      "services": [ref("gl-bench", "grouped_light")]})
     zones = [
         {"id": "z-downstairs", "type": "zone", "metadata": {"name": "Downstairs", "archetype": "downstairs"},
          "children": [ref("l-ceiling", "light"), ref("l-sofa", "light")],
@@ -176,6 +210,7 @@ def initial_state() -> dict[str, list[dict]]:
 STATE = initial_state()
 LOCK = threading.RLock()  # re-entrant: delayed group commands take it too
 _flaky_seen: set[str] = set()
+PUT_LOG: list[dict] = []  # GET /debug/puts
 
 
 def find(rtype: str, rid: str) -> dict | None:
@@ -199,12 +234,57 @@ def grouped_lights() -> list[dict]:
     return out
 
 
-def apply_light(l: dict, body: dict) -> str | None:
-    """Apply a light PUT body; return an error description or None."""
+def _unit(v: object) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1
+
+
+def _xy_ok(c: object) -> bool:
+    xy = c.get("xy") if isinstance(c, dict) else None
+    return isinstance(xy, dict) and _unit(xy.get("x")) and _unit(xy.get("y"))
+
+
+def check_light(l: dict, body: dict) -> str | None:
+    """Validate a light PUT body as a real bridge does; return an error description or None."""
+    name = l["metadata"]["name"]
     if "color" in body and "color" not in l:
-        return f"device ({l['metadata']['name']}) does not support color"
+        return f"device ({name}) does not support color"
+    if "color" in body and not _xy_ok(body["color"]):
+        return "color.xy: invalid value"
     if "color_temperature" in body and "color_temperature" not in l:
-        return f"device ({l['metadata']['name']}) does not support color_temperature"
+        return f"device ({name}) does not support color_temperature"
+    if "gradient" in body:
+        g, have = body["gradient"], l.get("gradient")
+        if have is None:
+            return f"device ({name}) does not support gradient"
+        if not isinstance(g, dict) or "points" not in g:
+            return "gradient.points is required"
+        points = g["points"]
+        if not isinstance(points, list):
+            return "gradient.points: invalid color"
+        if len(points) < 2:
+            # The real bridge answers 207 "invalid attribute value (.gradient.points)" for 0 or 1 points.
+            return "invalid attribute value (.gradient.points)"
+        if len(points) > have["points_capable"]:
+            return f"gradient.points: at most {have['points_capable']} points allowed"
+        if not all(isinstance(p, dict) and _xy_ok(p.get("color")) for p in points):
+            return "gradient.points: invalid color"
+        if "mode" in g and g["mode"] not in have["mode_values"]:
+            return f"gradient.mode: invalid value {g['mode']}"
+    if "effects" in body:
+        have = l.get("effects")
+        if have is None:
+            return f"device ({name}) does not support effects"
+        effect = body["effects"].get("effect") if isinstance(body["effects"], dict) else None
+        if effect not in have["effect_values"]:
+            return f"effects.effect: invalid value {effect}"
+    return None
+
+
+def apply_light(l: dict, body: dict) -> str | None:
+    """Apply a light PUT body; return an error description or None (nothing applied on error)."""
+    err = check_light(l, body)
+    if err:
+        return err
     if "metadata" in body and "name" in body["metadata"]:
         name = str(body["metadata"]["name"])
         if not 1 <= len(name) <= 32:
@@ -222,6 +302,18 @@ def apply_light(l: dict, body: dict) -> str | None:
     if "color" in body:
         l["color"] = {"xy": body["color"]["xy"]}
         l["color_temperature"] = {"mirek": None, "mirek_valid": False}
+    # A single colour or white temperature replaces a gradient: the bridge then lists no points.
+    if ("color" in body or "color_temperature" in body) and "gradient" in l:
+        l["gradient"]["points"] = []
+    if "gradient" in body:
+        l["gradient"]["points"] = [{"color": {"xy": dict(p["color"]["xy"])}} for p in body["gradient"]["points"]]
+        # As a real bridge does: the light's colour becomes the first gradient point.
+        l["color"] = {"xy": dict(body["gradient"]["points"][0]["color"]["xy"])}
+        l["color_temperature"] = {"mirek": None, "mirek_valid": False}
+        if "mode" in body["gradient"]:
+            l["gradient"]["mode"] = body["gradient"]["mode"]
+    if "effects" in body:
+        l["effects"]["status"] = body["effects"]["effect"]
     return None
 
 
@@ -256,6 +348,12 @@ class Handler(BaseHTTPRequestHandler):
             ]
             self._send(200, entries)
             return None
+        if self.path == "/debug/puts":
+            with LOCK:
+                if self.command == "DELETE":
+                    PUT_LOG.clear()
+                self._send(200, PUT_LOG)
+            return None
         parts = self.path.strip("/").split("/")
         if parts[:3] != ["clip", "v2", "resource"] or len(parts) < 4:
             self._error(404, "Not Found")
@@ -286,7 +384,14 @@ class Handler(BaseHTTPRequestHandler):
             i.pop("actions", None)
         self._send(200, {"errors": [], "data": items})
 
+    def do_DELETE(self) -> None:
+        if self.path == "/debug/puts":
+            self._route()
+        else:
+            self._error(405, "method not allowed")
+
     def do_PUT(self) -> None:
+        start = time.monotonic()
         parts = self._route()
         if parts is None:
             return
@@ -296,10 +401,27 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._error(400, "body contains invalid JSON")
             return
+        entry = {"path": self.path, "body": body, "start": start, "end": None}
+        with LOCK:
+            PUT_LOG.append(entry)
+        try:
+            self._put(parts, body)
+        finally:
+            with LOCK:
+                entry["end"] = time.monotonic()
+
+    def _put(self, parts: list[str], body: dict) -> None:
         if len(parts) != 2:
             self._error(405, "method not allowed")
             return
         rtype, rid = parts
+        if rtype == "light":
+            delay_ms = int(os.environ.get("MOCK_LIGHT_DELAY_MS") or 0)
+            if delay_ms:
+                time.sleep(delay_ms / 1000)
+            if rid == os.environ.get("MOCK_FAIL_LIGHT"):
+                self._error(500, "internal error (MOCK_FAIL_LIGHT)")
+                return
         with LOCK:
             if rtype == "light":
                 target = find("light", rid)
@@ -319,7 +441,8 @@ class Handler(BaseHTTPRequestHandler):
                     with LOCK:
                         for l in members:
                             # A group command skips capabilities a member lacks, as the bridge does.
-                            apply_light(l, {k: v for k, v in body.items() if k not in ("color", "color_temperature") or k in l})
+                            apply_light(l, {k: v for k, v in body.items()
+                                            if k not in ("color", "color_temperature", "gradient", "effects") or k in l})
 
                 delay_ms = int(os.environ.get("MOCK_GROUP_DELAY_MS") or 0)
                 if delay_ms:

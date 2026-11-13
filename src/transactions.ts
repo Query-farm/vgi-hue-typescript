@@ -41,6 +41,7 @@ import {
   hueRequest,
   lightsInGroup,
   pace,
+  putAll,
 } from "./hue.ts";
 import { log } from "./log.ts";
 
@@ -154,9 +155,6 @@ export function pendingLightBodies(txId: Uint8Array): Map<string, Record<string,
   return out;
 }
 
-/** The PUT path of a staged request. */
-const pathOf = (r: StagedRequest) => `/resource/${r.kind}/${encodeURIComponent(r.target)}`;
-
 /**
  * Merge back-to-back state changes to the same light into one request, so a
  * transaction that sets brightness then colour sends a single command. A
@@ -176,9 +174,15 @@ export function coalesce(requests: StagedRequest[]): StagedRequest[] {
       !("metadata" in last.body)
     ) {
       const merged = { ...last.body, ...r.body };
-      // A colour replaces a white temperature and vice versa.
+      // A colour replaces a white temperature and vice versa; either replaces a
+      // gradient, and a gradient replaces both.
       if ("color" in r.body) delete merged.color_temperature;
       if ("color_temperature" in r.body) delete merged.color;
+      if ("color" in r.body || "color_temperature" in r.body) delete merged.gradient;
+      if ("gradient" in r.body) {
+        delete merged.color;
+        delete merged.color_temperature;
+      }
       out[out.length - 1] = { ...last, body: merged };
     } else {
       out.push(r);
@@ -193,6 +197,9 @@ function restoreBody(l: HueLight): Record<string, unknown> {
   if (l.dimming) body.dimming = { brightness: l.dimming.brightness };
   if (l.color_temperature?.mirek != null) body.color_temperature = { mirek: l.color_temperature.mirek };
   else if (l.color?.xy) body.color = { xy: l.color.xy };
+  const points = l.gradient?.points?.filter((p) => p.color?.xy) ?? [];
+  if (points.length) body.gradient = { points, ...(l.gradient?.mode ? { mode: l.gradient.mode } : {}) };
+  if (l.effects?.status) body.effects = { effect: l.effects.status };
   return body;
 }
 
@@ -237,11 +244,8 @@ export async function commitTransaction(connect: () => Promise<BridgeConnection>
   const touched = await touchedLights(conn, requests, lights);
   let sent = 0;
   try {
-    for (const r of requests) {
-      await pace(r.kind === "light" ? "light" : "group");
-      await hueRequest(conn, "PUT", pathOf(r), r.body);
-      sent++;
-    }
+    // Pipelined and paced; on a refusal the requests in flight finish first.
+    await putAll(conn, requests, () => sent++);
   } catch (err) {
     const restored = await restoreLights(conn, sent ? touched : new Set(), before);
     throw new HueError(

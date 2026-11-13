@@ -24,6 +24,8 @@ tasks:
     check_sql: SELECT count(*) = 1 FROM hue.main.lights WHERE name = 'Reading lamp'
   - name: relax_living_room
     reference_sql: SELECT name, ok FROM hue.main.recall_scene('Relax', room := 'Living room')
+  - name: strip_gradient
+    reference_sql: SELECT name, ok FROM hue.main.set_gradient('Hallway strip', ['#ff0000', '#0000ff'])
   - name: warm_white_everywhere
     reference_sql: >-
       SELECT count(*) FILTER (WHERE ok) AS changed FROM hue.main.set_lights(

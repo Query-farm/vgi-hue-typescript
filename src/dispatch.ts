@@ -4,19 +4,19 @@
  */
 
 import { decodeAttachOptions } from "./attach.ts";
-import { type BridgeConnection, hueRequest, pace } from "./hue.ts";
+import { type BridgeConnection, putAll } from "./hue.ts";
 import { type StagedRequest, stage, stageable } from "./transactions.ts";
 
 /** Send (or stage) requests; resolves to which of the two happened. */
 export type Sender = (requests: StagedRequest[]) => Promise<"sent" | "staged">;
 
-/** Send at once, paced as Hue asks (~10 light / ~1 group command per second). */
+/**
+ * Send at once: paced as Hue asks (~10 light / ~1 group command per second)
+ * and pipelined, up to MAX_IN_FLIGHT at a time (see putAll in hue.ts).
+ */
 export function immediate(conn: BridgeConnection): Sender {
   return async (requests) => {
-    for (const r of requests) {
-      await pace(r.kind === "light" ? "light" : "group");
-      await hueRequest(conn, "PUT", `/resource/${r.kind}/${encodeURIComponent(r.target)}`, r.body);
-    }
+    await putAll(conn, requests);
     return "sent";
   };
 }

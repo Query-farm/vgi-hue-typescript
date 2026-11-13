@@ -21,6 +21,7 @@ import {
   FunctionStability,
   float64,
   int64,
+  list,
   utf8,
   type VgiDataType,
 } from "@query-farm/vgi";
@@ -30,6 +31,7 @@ import {
   type BridgeConnection,
   buildStateBody,
   getResources,
+  gradientBody,
   HueError,
   type HueGroup,
   type HueLight,
@@ -37,7 +39,10 @@ import {
   type HueZigbee,
   type LightChange,
   lightsInGroup,
+  parseColor,
   reachableByDevice,
+  rgbToXy,
+  type Xy,
 } from "./hue.ts";
 import { objectTags, resultColumns } from "./meta.ts";
 
@@ -227,6 +232,142 @@ export const setLightFn = defineTableFunction<SetLightArgs, DoneState>({
     {
       sql: "SELECT name, ok FROM hue.main.set_light('Desk lamp', power := false)",
       description: "Turn the desk lamp off",
+    },
+  ],
+});
+
+// -------------------------------------------------------------- set_gradient
+
+interface SetGradientArgs {
+  light: string;
+  colors: unknown;
+  mode: string | null;
+}
+
+export const DEFAULT_GRADIENT_MODE = "interpolated_palette";
+/** The CLIP v2 gradient modes; each light lists the ones it supports in gradient.mode_values. */
+export const GRADIENT_MODES = [
+  "interpolated_palette",
+  "interpolated_palette_mirrored",
+  "random_pixelated",
+  "segmented_palette",
+] as const;
+
+/** The colours of a set_gradient call as xy points; refused when empty, NULL or not colours. */
+export function gradientColors(colors: unknown): Xy[] {
+  const items = colors == null ? [] : (JSON.parse(JSON.stringify(colors)) as unknown[]);
+  if (!items.length) throw new HueError("set_gradient needs at least two colours");
+  return items.map((c) => {
+    if (c == null) throw new HueError("gradient points must not be NULL");
+    return rgbToXy(parseColor(String(c)));
+  });
+}
+
+export async function setGradient(
+  conn: BridgeConnection,
+  target: string,
+  points: Xy[],
+  mode: string = DEFAULT_GRADIENT_MODE,
+  send: Sender = immediate(conn),
+): Promise<ResultRow[]> {
+  const lights = await getResources<HueLight>(conn, "light");
+  const matches = matchByIdOrName(lights, target);
+  if (!matches.length) throw new HueError(`no light with id or name '${target}'. Lights: ${known(lights)}`);
+  // Validate every match before sending anything.
+  for (const light of matches) {
+    const name = light.metadata?.name ?? light.id;
+    if (!light.gradient) throw new HueError(`light '${name}' does not support gradients`);
+    const max = light.gradient.points_capable ?? 0;
+    if (points.length < 2 || points.length > max) {
+      throw new HueError(`light '${name}' takes 2–${max} gradient points, got ${points.length}`);
+    }
+    const modes = light.gradient.mode_values;
+    if (modes && !modes.includes(mode)) {
+      throw new HueError(`invalid gradient_mode '${mode}' for light '${name}'; allowed: ${modes.join(", ")}`);
+    }
+  }
+  const body = { gradient: gradientBody(points, mode) };
+  const rows: ResultRow[] = [];
+  for (const light of matches) {
+    await send([{ kind: "light", target: light.id, body }]);
+    rows.push({
+      target_type: "light",
+      target_id: light.id,
+      name: light.metadata?.name ?? null,
+      ok: true,
+      error: null,
+      request: JSON.stringify(body),
+      settled: null,
+    });
+  }
+  return rows;
+}
+
+export const setGradientFn = defineTableFunction<SetGradientArgs, DoneState>({
+  name: "set_gradient",
+  description: "Set the gradient of a gradient light (lightstrip, Play gradient) from a list of colours",
+  args: { light: utf8(), colors: list(utf8()), mode: utf8() },
+  argDefaults: { mode: DEFAULT_GRADIENT_MODE },
+  argDocs: {
+    light: "Light id or name (case-insensitive); every light with that name is changed.",
+    colors:
+      "The gradient points in order, each a '#rrggbb' colour or a basic colour name; from 2 up to the light's gradient_points_capable.",
+    mode: "Named, optional: how the points are spread over the light; one the light lists as supported.",
+  },
+  argConstraints: { mode: { choices: [...GRADIENT_MODES] } },
+  stability: FunctionStability.VOLATILE,
+  onBind: (params) => {
+    gradientColors(params.args.colors); // reject bad colours before anything runs
+    return { outputSchema: RESULT.schema };
+  },
+  initialState: () => ({ done: false }),
+  process: async (params, state, out) => {
+    if (state.done) {
+      out.finish();
+      return;
+    }
+    const conn = await connectionFor(params.initCall.bind_call);
+    const rows = await setGradient(
+      conn,
+      params.args.light,
+      gradientColors(params.args.colors),
+      params.args.mode ?? DEFAULT_GRADIENT_MODE,
+      senderFor(params.initCall.bind_call, conn),
+    );
+    out.emit(batchFromColumns(toColumns(rows), params.outputSchema));
+    state.done = true;
+  },
+  tags: {
+    ...objectTags({
+      title: "Set Gradient",
+      category: "control",
+      keywords: "hue, gradient, lightstrip, play gradient, multicolour, palette, segments, light control",
+      docLlm:
+        "Set the gradient of a gradient-capable light (a Hue gradient lightstrip or Play gradient " +
+        "bar: `gradient_points_capable` is not NULL in `lights`) and return what was sent. " +
+        "Arguments: `light` (positional) is a light id or case-insensitive name from `lights`; " +
+        "`colors` (positional) is a `VARCHAR[]` of '#rrggbb' colours or basic colour names, the " +
+        "gradient points in order, 2 up to the light's `gradient_points_capable`; `mode := ...` " +
+        "(named, optional, default 'interpolated_palette') is one of the light's gradient modes: " +
+        "'interpolated_palette', 'interpolated_palette_mirrored', 'random_pixelated', " +
+        "'segmented_palette'. A light without a gradient, fewer than 2 or too many colours or an unknown mode is " +
+        "an error and nothing is sent. Returns one row per light changed: `target_type` ('light'), " +
+        "`target_id`, `name`, `ok`, `error`, `request`, `settled`. Updating the `gradient_hex` " +
+        "column of `lights` does the same. Changes real lights: call it only when asked.",
+      docMd:
+        "## set_gradient(light, colors, mode := 'interpolated_palette')\n\n" +
+        "Set a gradient light's points from a list of '#rrggbb' colours.",
+    }),
+    "vgi.result_columns_schema": RESULT.tag,
+  },
+  examples: [
+    {
+      sql: "SELECT name, ok FROM hue.main.set_gradient('Hallway strip', ['#ff0000', '#ff8000', '#0000ff'])",
+      description: "A red-orange-blue gradient on the hallway lightstrip",
+    },
+    {
+      sql: "SELECT name, request FROM hue.main.set_gradient('Hallway strip', ['#00ff00', '#0000ff'], mode := 'segmented_palette')",
+      description: "Two solid segments, green and blue",
     },
   ],
 });

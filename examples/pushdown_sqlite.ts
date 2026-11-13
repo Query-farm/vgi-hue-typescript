@@ -8,9 +8,12 @@
  *   SELECT id, amount FROM pushdown_sqlite.main.orders() WHERE region = 'west' AND amount > 900;
  *
  * Only simple top-level comparisons, IN lists and IS [NOT] NULL are translated
- * here; anything else is left for DuckDB, which always re-checks every row it
- * receives, so partial pushdown is safe. The demo database (bun:sqlite, no
- * dependency) is created on first use in the system temp directory.
+ * here. DuckDB removes every predicate it pushes into a table function from its
+ * own plan and does not re-check the rows (`NOT IN`, `NOT LIKE` ... would
+ * otherwise come back unfiltered), so the function sets `autoApplyFilters`: the
+ * SDK re-applies all pushed filters to the rows emitted, and the SQL WHERE is
+ * only an optimization that may keep extra rows. The demo database (bun:sqlite,
+ * no dependency) is created on first use in the system temp directory.
  */
 
 import { Database, type SQLQueryBindings } from "bun:sqlite";
@@ -103,6 +106,8 @@ export const orders = defineTableFunction<Record<string, never>, { lastId: numbe
   description: "Orders from a SQLite database, with filter and projection pushdown",
   filterPushdown: true,
   projectionPushdown: true,
+  // The SQL below translates only some predicates; the SDK applies all of them.
+  autoApplyFilters: true,
   onBind: () => ({ outputSchema: ORDERS_SCHEMA }),
 
   // Keyset pagination cursor: the last id emitted.
@@ -111,9 +116,12 @@ export const orders = defineTableFunction<Record<string, never>, { lastId: numbe
     return { lastId: 0 };
   },
 
-  // Fetch one page of matching rows, selecting only the projected columns.
+  // Fetch one page of matching rows, selecting only the projected columns
+  // (plus, when filters were pushed, every column so the SDK can apply them).
   process: (params, state, out) => {
-    const wanted = params.outputSchema.fields.map((f) => f.name);
+    const filtered = (params.pushdownFilters?.filters.length ?? 0) > 0;
+    const emitSchema = filtered ? ORDERS_SCHEMA : params.outputSchema;
+    const wanted = emitSchema.fields.map((f) => f.name);
     const values: SQLQueryBindings[] = [state.lastId];
     const clauses = ["id > ?"];
     for (const predicate of params.pushdownFilters?.filters ?? []) {
@@ -135,7 +143,7 @@ export const orders = defineTableFunction<Record<string, never>, { lastId: numbe
     const columns = Object.fromEntries(
       wanted.map((name, i) => [name, rows.map((r) => (name === "region" ? r[i + 1] : BigInt(r[i + 1] ?? 0)))]),
     );
-    out.emit(batchFromColumns(columns, params.outputSchema));
+    out.emit(batchFromColumns(columns, emitSchema));
   },
 });
 

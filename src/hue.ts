@@ -156,6 +156,22 @@ export interface HueLight {
   dimming?: { brightness: number };
   color_temperature?: { mirek: number | null; mirek_valid?: boolean };
   color?: { xy: { x: number; y: number } };
+  /** Gradient lights (lightstrips, Play gradient, ...): CLIP v2 `gradient`. */
+  gradient?: {
+    points?: { color?: { xy?: { x: number; y: number } } }[];
+    points_capable?: number;
+    mode?: string;
+    mode_values?: string[];
+    pixel_count?: number;
+  };
+  /** Lights with built-in effects: CLIP v2 `effects`. */
+  effects?: { status?: string; status_values?: string[]; effect_values?: string[] };
+}
+
+/** A CIE 1931 xy chromaticity. */
+export interface Xy {
+  x: number;
+  y: number;
 }
 
 export interface HueDevice {
@@ -328,14 +344,39 @@ export interface LightChange {
   brightness?: number | null;
   kelvin?: number | null;
   color?: string | null;
+  /** A CIE xy colour, sent as is (UPDATE ... SET color_x / color_y). */
+  xy?: Xy | null;
+  /** Gradient points (and optionally the mode) for a gradient light. */
+  gradient?: { points: Xy[]; mode?: string } | null;
+  /** A light effect ('no_effect' stops one). */
+  effect?: string | null;
   transition_ms?: number | null;
+}
+
+/** Refuse a chromaticity coordinate outside 0–1. */
+export function checkUnit(what: string, value: number): void {
+  if (!(value >= 0 && value <= 1)) throw new HueError(`${what} must be 0–1, got ${value}`);
+}
+
+export const COLOR_XY_CONFLICT = "set either color_hex or color_x/color_y, not both";
+export const GRADIENT_COLOR_CONFLICT =
+  "set either a gradient or a single colour (color_hex, color_x/color_y, color_temperature_kelvin), not both";
+
+/** The CLIP v2 `gradient` PUT object. */
+export function gradientBody(points: Xy[], mode?: string | null): Record<string, unknown> {
+  return {
+    points: points.map(({ x, y }) => ({ color: { xy: { x, y } } })),
+    ...(mode != null ? { mode } : {}),
+  };
 }
 
 /** Build the CLIP v2 PUT body for a light or grouped_light. */
 export function buildStateBody(change: LightChange): Record<string, unknown> {
   const body: Record<string, unknown> = {};
-  const { on, brightness, kelvin, color, transition_ms } = change;
+  const { on, brightness, kelvin, color, xy, gradient, effect, transition_ms } = change;
   if (kelvin != null && color != null) throw new HueError("pass either kelvin or color, not both");
+  if (color != null && xy != null) throw new HueError(COLOR_XY_CONFLICT);
+  if (gradient != null && (color != null || xy != null || kelvin != null)) throw new HueError(GRADIENT_COLOR_CONFLICT);
   if (brightness != null) {
     if (brightness < 0 || brightness > 100) throw new HueError(`brightness must be 0–100, got ${brightness}`);
     if (brightness === 0) {
@@ -353,6 +394,13 @@ export function buildStateBody(change: LightChange): Record<string, unknown> {
     body.color_temperature = { mirek: kelvinToMirek(kelvin) };
   }
   if (color != null) body.color = { xy: rgbToXy(parseColor(color)) };
+  if (xy != null) {
+    checkUnit("color_x", xy.x);
+    checkUnit("color_y", xy.y);
+    body.color = { xy: { x: xy.x, y: xy.y } };
+  }
+  if (gradient != null) body.gradient = gradientBody(gradient.points, gradient.mode);
+  if (effect != null) body.effects = { effect };
   if (transition_ms != null) {
     if (transition_ms < 0) throw new HueError(`transition_ms must be >= 0, got ${transition_ms}`);
     body.dynamics = { duration: Math.round(transition_ms) };
@@ -363,14 +411,95 @@ export function buildStateBody(change: LightChange): Record<string, unknown> {
   return body;
 }
 
+/** When the last command of each kind was (or is booked to be) started. */
 const lastCommandAt: Record<string, number> = {};
 
-/** Space commands of one kind out so a bulk update stays inside Hue's rate limits. */
+/**
+ * Space commands of one kind out so a bulk update stays inside Hue's rate
+ * limits. Each call books the next free start slot before it sleeps, so
+ * concurrent callers get distinct slots `gapMs` apart.
+ */
 export async function pace(
   kind: "light" | "group",
   gapMs = kind === "light" ? LIGHT_COMMAND_GAP_MS : GROUP_COMMAND_GAP_MS,
 ) {
-  const wait = (lastCommandAt[kind] ?? 0) + gapMs - Date.now();
-  if (wait > 0) await sleep(wait);
-  lastCommandAt[kind] = Date.now();
+  const now = Date.now();
+  const slot = Math.max(now, (lastCommandAt[kind] ?? 0) + gapMs);
+  lastCommandAt[kind] = slot;
+  if (slot > now) await sleep(slot - now);
+}
+
+/** At most this many PUTs are in flight at once (see putAll). */
+export const MAX_IN_FLIGHT = 4;
+
+/** One PUT to `/resource/<kind>/<target>`. */
+export interface PutRequest {
+  kind: string;
+  target: string;
+  body: unknown;
+}
+
+/**
+ * Send PUTs to the bridge, pipelined. Start times stay paced (`pace`: ~10
+ * light / ~1 group command per second), but a request does not wait for the
+ * previous response: up to MAX_IN_FLIGHT are in flight at once, so a bulk
+ * update is bound by Hue's rate limit instead of by round trips.
+ *
+ * Order: requests to the same light run one after another, in the order
+ * given. A group command (grouped_light, scene) covers many lights, so it
+ * runs alone: it starts once everything before it has finished, and nothing
+ * after it starts until it has finished.
+ *
+ * Each request retries on its own (hueRequest). On the first failure no new
+ * request starts; the ones in flight finish, then the first error is thrown.
+ * Requests that succeeded stay applied. `onSent` is called for each request
+ * the bridge accepted.
+ */
+export async function putAll(
+  conn: BridgeConnection,
+  requests: readonly PutRequest[],
+  onSent: (r: PutRequest) => void = () => {},
+): Promise<void> {
+  const pending = [...requests];
+  const inFlight = new Set<Promise<void>>();
+  const busy = new Set<string>(); // targets with a request in flight
+  let failure: { error: unknown } | null = null;
+
+  /** Index of the next request that may start now, or -1. */
+  const next = () => {
+    if (inFlight.size >= MAX_IN_FLIGHT) return -1;
+    for (let i = 0; i < pending.length; i++) {
+      const r = pending[i] as PutRequest;
+      if (r.kind !== "light") return i === 0 && inFlight.size === 0 ? 0 : -1; // a barrier
+      if (!busy.has(r.target)) return i;
+    }
+    return -1;
+  };
+
+  while (pending.length && !failure) {
+    const i = next();
+    if (i < 0) {
+      await Promise.race(inFlight);
+      continue;
+    }
+    const [r] = pending.splice(i, 1) as [PutRequest];
+    busy.add(r.target);
+    await pace(r.kind === "light" ? "light" : "group");
+    if (failure) break; // an in-flight request failed while this one waited for its slot
+    const p: Promise<void> = hueRequest(conn, "PUT", `/resource/${r.kind}/${encodeURIComponent(r.target)}`, r.body)
+      .then(
+        () => onSent(r),
+        (error) => {
+          failure ??= { error };
+        },
+      )
+      .finally(() => {
+        busy.delete(r.target);
+        inFlight.delete(p);
+      });
+    inFlight.add(p);
+    if (r.kind !== "light") await p; // a barrier runs alone
+  }
+  await Promise.all(inFlight);
+  if (failure) throw (failure as { error: unknown }).error;
 }

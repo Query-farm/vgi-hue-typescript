@@ -12,30 +12,61 @@ import {
   field,
   float64,
   int64,
+  list,
   schema,
+  struct,
   utf8,
   VgiClient,
+  type VgiDataType,
 } from "@query-farm/vgi";
 import { subprocessConnect } from "@query-farm/vgi-rpc";
 import { bridgeOptionsFrom, decodeAttachOptions } from "../src/attach.ts";
-import { lightReflects, matchByIdOrName, recallScene, setLight, setRoom } from "../src/control.ts";
+import {
+  gradientColors,
+  lightReflects,
+  matchByIdOrName,
+  recallScene,
+  setGradient,
+  setLight,
+  setRoom,
+} from "../src/control.ts";
 import { candidateUrl, chooseBridge, discoverBridge, isBridgeId, mdnsQuery } from "../src/discovery.ts";
+import { immediate } from "../src/dispatch.ts";
 import {
   type BridgeConnection,
   buildStateBody,
   getResources,
+  HueError,
   type HueLight,
   hueRequest,
   kelvinToMirek,
+  LIGHT_COMMAND_GAP_MS,
   lightLevelToLux,
+  MAX_IN_FLIGHT,
   parseColor,
+  putAll,
   resolveConnection,
   rgbToXy,
   xyToHex,
 } from "../src/hue.ts";
 import { lightRowId, lightRows, roomRows, sensorRows } from "../src/inventory.ts";
-import { applyToRow, checkKnownColumns, rowChange, updateBody, updateRequests } from "../src/lights_write.ts";
-import { coalesce, stageable } from "../src/transactions.ts";
+import {
+  applyToRow,
+  checkKnownColumns,
+  lightCaps,
+  lightUpdateRequests,
+  rowChange,
+  updateBody,
+  updateRequests,
+} from "../src/lights_write.ts";
+import {
+  beginTransaction,
+  coalesce,
+  commitTransaction,
+  type StagedRequest,
+  stage,
+  stageable,
+} from "../src/transactions.ts";
 
 const ROOT = join(import.meta.dir, "..");
 
@@ -306,7 +337,7 @@ describe("against the mock bridge", () => {
 
   test("GET retries a 429 and returns data", async () => {
     const lights = await getResources<HueLight>(conn, "light");
-    expect(lights.map((l) => l.id).sort()).toEqual(["l-ceiling", "l-desk", "l-pendant", "l-sofa"]);
+    expect(lights.map((l) => l.id).sort()).toEqual(["l-ceiling", "l-desk", "l-pendant", "l-sofa", "l-strip"]);
   });
 
   test("errors carry the HTTP status", async () => {
@@ -327,6 +358,59 @@ describe("against the mock bridge", () => {
     expect(lights.find((l) => l.id === "l-sofa")?.dimming?.brightness).toBe(20);
     await expect(recallScene(conn, "Relax", null)).rejects.toThrow(/several rooms/);
     expect((await recallScene(conn, "Bright", "kitchen"))[0]?.target_id).toBe("s-bright-kitchen");
+  });
+
+  test("set_gradient sends the points and mode; a light without a gradient sends nothing", async () => {
+    const [row] = await setGradient(conn, "hallway strip", gradientColors(["#ff0000", "blue"]), "segmented_palette");
+    expect(row).toMatchObject({ target_type: "light", target_id: "l-strip", ok: true });
+    expect(JSON.parse(row?.request ?? "")).toEqual({
+      gradient: {
+        points: [{ color: { xy: { x: 0.7006, y: 0.2993 } } }, { color: { xy: { x: 0.1355, y: 0.0399 } } }],
+        mode: "segmented_palette",
+      },
+    });
+    const strip = (await getResources<HueLight>(conn, "light")).find((l) => l.id === "l-strip");
+    expect(strip?.gradient?.mode).toBe("segmented_palette");
+    expect(strip?.gradient?.points?.length).toBe(2);
+    await expect(setGradient(conn, "Sofa lamp", [{ x: 0.3, y: 0.3 }])).rejects.toThrow(
+      "light 'Sofa lamp' does not support gradients",
+    );
+    const six = gradientColors(["red", "green", "blue", "red", "green", "blue"]);
+    await expect(setGradient(conn, "Hallway strip", six)).rejects.toThrow(
+      "light 'Hallway strip' takes 2–5 gradient points, got 6",
+    );
+    const before = (await getResources<HueLight>(conn, "light")).find((l) => l.id === "l-strip")?.gradient;
+    await expect(setGradient(conn, "Hallway strip", six.slice(0, 1))).rejects.toThrow(
+      "light 'Hallway strip' takes 2–5 gradient points, got 1",
+    );
+    await expect(setGradient(conn, "Hallway strip", [])).rejects.toThrow("got 0");
+    expect((await getResources<HueLight>(conn, "light")).find((l) => l.id === "l-strip")?.gradient).toEqual(before);
+    await expect(setGradient(conn, "Hallway strip", six.slice(0, 2), "swirl")).rejects.toThrow(
+      /invalid gradient_mode 'swirl' for light 'Hallway strip'; allowed: interpolated_palette, /,
+    );
+    expect(() => gradientColors([])).toThrow("set_gradient needs at least two colours");
+    expect(() => gradientColors(["#ff0000", null])).toThrow("gradient points must not be NULL");
+  });
+
+  test("the mock refuses invalid gradient, effect and xy PUTs like a bridge (HTTP 400)", async () => {
+    const put = (id: string, body: unknown) => hueRequest(conn, "PUT", `/resource/light/${id}`, body);
+    await expect(put("l-strip", { gradient: { mode: "segmented_palette" } })).rejects.toThrow(
+      /HTTP 400: gradient.points is required/,
+    );
+    const xy = { color: { xy: { x: 0.3, y: 0.3 } } };
+    await expect(put("l-strip", { gradient: { points: Array(6).fill(xy) } })).rejects.toThrow(/at most 5 points/);
+    await expect(put("l-strip", { gradient: { points: [xy] } })).rejects.toThrow(
+      /HTTP 400: invalid attribute value \(\.gradient\.points\)/,
+    );
+    await expect(put("l-strip", { gradient: { points: [] } })).rejects.toThrow(/HTTP 400: invalid attribute value/);
+    await expect(put("l-strip", { gradient: { points: [xy, xy], mode: "swirl" } })).rejects.toThrow(/gradient.mode/);
+    await expect(put("l-sofa", { gradient: { points: [xy] } })).rejects.toThrow(/does not support gradient/);
+    await expect(put("l-sofa", { effects: { effect: "disco" } })).rejects.toThrow(/effects.effect: invalid value/);
+    await expect(put("l-pendant", { effects: { effect: "candle" } })).rejects.toThrow(/does not support effects/);
+    await expect(put("l-sofa", { color: { xy: { x: 1.5, y: 0.3 } } })).rejects.toThrow(/color.xy: invalid value/);
+    await put("l-sofa", { effects: { effect: "candle" } });
+    const sofa = (await getResources<HueLight>(conn, "light")).find((l) => l.id === "l-sofa");
+    expect(sofa?.effects?.status).toBe("candle");
   });
 
   test("the worker falls back to HUE_BRIDGE / HUE_APP_KEY", async () => {
@@ -522,8 +606,193 @@ describe("UPDATE hue.main.lights", () => {
   });
 });
 
+describe("UPDATE hue.main.lights: xy colours, gradients and effects", () => {
+  const XY = struct([field("x", float64()), field("y", float64())]);
+  const TYPES: Record<string, VgiDataType> = {
+    color_x: float64(),
+    color_y: float64(),
+    color_temperature_kelvin: int64(),
+    gradient_hex: list(utf8()),
+    gradient_xy: list(XY),
+  };
+  const input = (cols: Record<string, unknown>) =>
+    batchFromColumns(
+      { ...Object.fromEntries(Object.entries(cols).map(([k, v]) => [k, [v]])), rowid: [1n] },
+      schema([...Object.keys(cols).map((k) => field(k, TYPES[k] ?? utf8(), true)), field("rowid", int64(), false)]),
+    );
+  const EFFECTS = ["no_effect", "candle", "fire"];
+  const MODES = ["interpolated_palette", "segmented_palette"];
+  const stripLight: HueLight = {
+    id: "l-strip",
+    owner: { rid: "d", rtype: "device" },
+    metadata: { name: "Strip" },
+    color: { xy: { x: 0.3, y: 0.3 } },
+    gradient: {
+      points: [{ color: { xy: { x: 0.7006, y: 0.2993 } } }, { color: { xy: { x: 0.1355, y: 0.0399 } } }],
+      points_capable: 3,
+      mode: "interpolated_palette",
+      mode_values: MODES,
+      pixel_count: 10,
+    },
+    effects: { status: "no_effect", effect_values: EFFECTS },
+  };
+  const strip = lightRows([stripLight], [], [], []);
+  const stripRow = Object.fromEntries(Object.entries(strip).map(([k, v]) => [k, v[0]]));
+  const caps = lightCaps(stripLight);
+  const white = lightCaps({ id: "w", owner: { rid: "d", rtype: "device" }, metadata: { name: "White" } });
+  const change = (cols: Record<string, unknown>, c = caps) => rowChange(input(cols), 0, stripRow, c).change;
+
+  test("the strip's row: gradient columns and effect", () => {
+    expect(stripRow).toMatchObject({
+      gradient_hex: ["#ff0000", "#0000ff"],
+      gradient_xy: [
+        { x: 0.7006, y: 0.2993 },
+        { x: 0.1355, y: 0.0399 },
+      ],
+      gradient_mode: "interpolated_palette",
+      gradient_points_capable: 3,
+      gradient_pixel_count: 10,
+      effect: "no_effect",
+    });
+    const plainLight = lightRows([{ id: "p", owner: { rid: "d", rtype: "device" } }], [], [], []);
+    expect([plainLight.gradient_hex, plainLight.gradient_xy, plainLight.effect]).toEqual([[null], [null], [null]]);
+  });
+
+  test("color_x / color_y: both, or one with the other kept; sent without a hex round trip", () => {
+    expect(change({ color_x: 0.17, color_y: 0.7 })).toEqual({ xy: { x: 0.17, y: 0.7 } });
+    expect(change({ color_y: 0.5 })).toEqual({ xy: { x: 0.3, y: 0.5 } });
+    // RETURNING passes unchanged columns too: they are no change.
+    expect(change({ color_x: 0.3, color_y: 0.3, gradient_hex: ["#FF0000", "#0000ff"] })).toEqual({});
+    expect(buildStateBody({ xy: { x: 0.17, y: 0.7 } })).toEqual({ color: { xy: { x: 0.17, y: 0.7 } } });
+    const row = applyToRow(stripRow, buildStateBody({ xy: { x: 0.17, y: 0.7 } }));
+    expect(row).toMatchObject({ color_mode: "xy", color_x: 0.17, color_y: 0.7, gradient_hex: [], gradient_xy: [] });
+  });
+
+  test("xy errors: with color_hex, out of range, a light without colour", () => {
+    expect(() => change({ color_hex: "#ff0000", color_x: 0.2 })).toThrow(
+      "set either color_hex or color_x/color_y, not both",
+    );
+    expect(() => change({ color_x: 1.5 })).toThrow("color_x must be 0–1, got 1.5");
+    expect(() => change({ color_y: -0.1 })).toThrow("color_y must be 0–1, got -0.1");
+    expect(() => change({ color_x: 0.2 }, white)).toThrow("light 'White' does not support color");
+    expect(() => buildStateBody({ xy: { x: 0.2, y: 0.2 }, color: "red" })).toThrow(/not both/);
+  });
+
+  test("gradient_hex and gradient_xy become points; gradient_mode alone re-sends the current points", () => {
+    expect(change({ gradient_hex: ["#ff0000", "green"] })).toEqual({
+      gradient: {
+        points: [
+          { x: 0.7006, y: 0.2993 },
+          { x: 0.1724, y: 0.7468 },
+        ],
+      },
+    });
+    const two = [
+      { x: 0.2, y: 0.3 },
+      { x: 0.6, y: 0.35 },
+    ];
+    expect(change({ gradient_xy: two, gradient_mode: "segmented_palette" })).toEqual({
+      gradient: { points: two, mode: "segmented_palette" },
+    });
+    const modeOnly = change({ gradient_mode: "segmented_palette" });
+    expect(modeOnly.gradient).toEqual({ points: stripRow.gradient_xy as never, mode: "segmented_palette" });
+    const body = buildStateBody(modeOnly);
+    expect(body).toEqual({
+      gradient: {
+        points: [{ color: { xy: { x: 0.7006, y: 0.2993 } } }, { color: { xy: { x: 0.1355, y: 0.0399 } } }],
+        mode: "segmented_palette",
+      },
+    });
+    const greenBlue = [
+      { x: 0.1724, y: 0.7468 },
+      { x: 0.1355, y: 0.0399 },
+    ];
+    // The bridge sets the light's colour to the first point: RETURNING reports it.
+    expect(applyToRow(stripRow, buildStateBody(change({ gradient_xy: greenBlue })))).toMatchObject({
+      gradient_hex: ["#00ff00", "#0000ff"],
+      gradient_xy: greenBlue,
+      gradient_mode: "interpolated_palette",
+      color_mode: "xy",
+      color_temperature_kelvin: null,
+      color_x: 0.1724,
+      color_y: 0.7468,
+      color_hex: "#00ff00",
+    });
+  });
+
+  test("gradient errors", () => {
+    const four = ["#ff0000", "#00ff00", "#0000ff", "#ffffff"];
+    expect(() => change({ gradient_hex: four })).toThrow("light 'Strip' takes 2–3 gradient points, got 4");
+    expect(() => change({ gradient_hex: [] })).toThrow("got 0");
+    expect(() => change({ gradient_hex: ["#ff0000"] })).toThrow("light 'Strip' takes 2–3 gradient points, got 1");
+    expect(() => change({ gradient_xy: [{ x: 0.2, y: 0.3 }] })).toThrow("got 1");
+    // gradient_mode alone on a light whose gradient was cleared (a single colour): nothing to re-send.
+    const cleared = { ...stripRow, gradient_hex: [], gradient_xy: [] };
+    expect(() => rowChange(input({ gradient_mode: "segmented_palette" }), 0, cleared, caps)).toThrow(
+      "light 'Strip' has no gradient to change the mode of; set gradient_hex or gradient_xy too",
+    );
+    // ...but with new points in the same statement it goes through.
+    expect(
+      rowChange(input({ gradient_mode: "segmented_palette", gradient_hex: ["#ff0000", "#0000ff"] }), 0, cleared, caps)
+        .change.gradient?.mode,
+    ).toBe("segmented_palette");
+    expect(() => change({ gradient_mode: "swirl" })).toThrow(
+      "invalid gradient_mode 'swirl' for light 'Strip'; allowed: interpolated_palette, segmented_palette",
+    );
+    expect(() => change({ gradient_hex: ["#ff0000"] }, white)).toThrow("light 'White' does not support gradients");
+    expect(() => change({ gradient_hex: ["#ff0000"], color_hex: "#00ff00" })).toThrow(
+      "set either a gradient or a single colour (color_hex, color_x/color_y, color_temperature_kelvin), not both",
+    );
+    expect(() => change({ gradient_mode: "segmented_palette", color_temperature_kelvin: 3000n })).toThrow(
+      /single colour/,
+    );
+    expect(() => change({ gradient_hex: ["#ff0000"], gradient_xy: [{ x: 0.1, y: 0.1 }] })).toThrow(
+      "set either gradient_hex or gradient_xy, not both",
+    );
+    expect(() => change({ gradient_hex: ["#ff0000", null] })).toThrow("gradient points must not be NULL");
+    expect(() => change({ gradient_xy: [{ x: 0.1, y: null }] })).toThrow("gradient points must not be NULL");
+    expect(() => change({ gradient_xy: [{ x: 1.5, y: 0.3 }] })).toThrow("gradient x and y must be 0–1, got (1.5, 0.3)");
+    expect(() => change({ gradient_hex: ["#zz"] })).toThrow(/invalid color '#zz'/);
+    expect(() => change({ gradient_xy: null })).toThrow("cannot SET gradient_xy = NULL on a light");
+    expect(() => change({ gradient_pixel_count: "3" })).toThrow(/cannot UPDATE 'gradient_pixel_count'/);
+  });
+
+  test("effect: set, clear, refused values and lights without effects", () => {
+    expect(change({ effect: "candle" })).toEqual({ effect: "candle" });
+    expect(buildStateBody({ effect: "no_effect" })).toEqual({ effects: { effect: "no_effect" } });
+    expect(applyToRow(stripRow, { effects: { effect: "fire" } })).toMatchObject({ effect: "fire" });
+    expect(() => change({ effect: "disco" })).toThrow(
+      "invalid effect 'disco' for light 'Strip'; allowed: no_effect, candle, fire",
+    );
+    expect(() => change({ effect: "candle" }, white)).toThrow("light 'White' does not support effects");
+  });
+
+  test("a gradient, an effect and other state go in one request; a rename in its own", () => {
+    const body = buildStateBody({ on: true, gradient: { points: [{ x: 0.1, y: 0.2 }] }, effect: "candle" });
+    expect(updateRequests(updateBody({ on: true, effect: "candle" }, "New"))).toEqual([
+      { on: { on: true }, effects: { effect: "candle" } },
+      { metadata: { name: "New" } },
+    ]);
+    expect(body).toEqual({
+      on: { on: true },
+      gradient: { points: [{ color: { xy: { x: 0.1, y: 0.2 } } }] },
+      effects: { effect: "candle" },
+    });
+  });
+});
+
 describe("transactions", () => {
   const light = (target: string, body: Record<string, unknown>) => ({ kind: "light" as const, target, body });
+
+  test("a colour replaces a staged gradient and a gradient a staged colour", () => {
+    const g = { gradient: { points: [{ color: { xy: { x: 0.1, y: 0.2 } } }] } };
+    expect(coalesce([light("s", g), light("s", { color: { xy: { x: 0.3, y: 0.3 } } })])).toEqual([
+      light("s", { color: { xy: { x: 0.3, y: 0.3 } } }),
+    ]);
+    expect(
+      coalesce([light("s", { color_temperature: { mirek: 300 }, effects: { effect: "fire" } }), light("s", g)]),
+    ).toEqual([light("s", { effects: { effect: "fire" }, ...g })]);
+  });
 
   test("back-to-back changes to one light merge; colour replaces white temperature", () => {
     expect(
@@ -560,4 +829,209 @@ describe("transactions", () => {
     expect(stageable(true, id)).toBe(id);
     expect(() => stageable(true, new Uint8Array(73))).toThrow(/0.48.4 or later/);
   });
+});
+
+// --------------------------------------------------- pipelined PUTs (putAll)
+
+interface PutLog {
+  path: string;
+  body: Record<string, unknown>;
+  start: number;
+  end: number | null;
+}
+
+const putLog = async (url: string): Promise<PutLog[]> => (await fetch(`${url}/debug/puts`)).json() as Promise<PutLog[]>;
+const clearPutLog = (url: string) => fetch(`${url}/debug/puts`, { method: "DELETE" });
+const benchLight = (n: number, body: Record<string, unknown> = { on: { on: true } }): StagedRequest => ({
+  kind: "light",
+  target: `l-bench-${n}`,
+  body,
+});
+/** Commit tests stage in a private SQLite file, not the shared default. */
+const privateTxDir = () => {
+  process.env.HUE_TX_DIR = join(tmpdir(), `vgi-hue-test-tx-${process.pid}`);
+};
+const twelve = () => Array.from({ length: 12 }, (_, i) => benchLight(i + 1));
+/** Most requests the bridge had open at the same time. */
+const maxOverlap = (log: PutLog[]) =>
+  Math.max(...log.map((a) => log.filter((b) => b.start <= a.start && (b.end ?? Infinity) > a.start).length));
+/** Smallest gap between consecutive request starts, in ms. */
+const minStartGapMs = (log: PutLog[]) => {
+  const starts = log.map((e) => e.start).sort((a, b) => a - b);
+  return Math.min(...starts.slice(1).map((s, i) => (s - (starts[i] as number)) * 1000));
+};
+
+/**
+ * When the worker itself started each PUT (performance.now() ms), recorded by
+ * wrapping fetch: the bridge sees them later, with its own scheduling jitter.
+ */
+async function clientPutStarts(run: () => Promise<unknown>): Promise<number[]> {
+  const real = globalThis.fetch;
+  const starts: number[] = [];
+  globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    if (init?.method === "PUT") starts.push(performance.now());
+    return real(input, init);
+  }) as typeof fetch;
+  try {
+    await run();
+  } finally {
+    globalThis.fetch = real;
+  }
+  return starts;
+}
+
+/** Starts honour the pace: each gap is ~the light gap, and n starts span at least (n-1) gaps. */
+function expectPaced(starts: number[]) {
+  const gaps = starts.slice(1).map((t, i) => t - (starts[i] as number));
+  expect(Math.min(...gaps)).toBeGreaterThanOrEqual(LIGHT_COMMAND_GAP_MS - 10); // timer jitter
+  for (let i = 1; i < starts.length; i++) {
+    expect((starts[i] as number) - (starts[0] as number)).toBeGreaterThanOrEqual(i * LIGHT_COMMAND_GAP_MS - 2);
+  }
+}
+
+describe("pipelined light PUTs (300 ms per request)", () => {
+  let mock: Awaited<ReturnType<typeof startMock>>;
+  let conn: BridgeConnection;
+  beforeAll(async () => {
+    privateTxDir();
+    mock = await startMock({ MOCK_EXTRA_LIGHTS: "12", MOCK_LIGHT_DELAY_MS: "300" });
+    conn = { baseUrl: mock.url, appKey: "test-key" };
+  });
+  afterAll(() => mock?.proc.kill());
+
+  test("12 lights overlap their round trips, but starts stay paced", async () => {
+    await clearPutLog(mock.url);
+    const t0 = performance.now();
+    const starts = await clientPutStarts(() => immediate(conn)(twelve()));
+    const ms = performance.now() - t0;
+    expect(starts).toHaveLength(12);
+    expectPaced(starts);
+    // Sequential would be 12 x 300 = 3600 ms; pipelined is ~11 gaps + one round trip.
+    const ideal = 11 * LIGHT_COMMAND_GAP_MS + 300;
+    expect(ms).toBeLessThan(12 * 300 * 0.65);
+    expect(ms).toBeGreaterThanOrEqual(ideal - 30);
+    const log = await putLog(mock.url);
+    expect(log).toHaveLength(12);
+    expect(minStartGapMs(log)).toBeGreaterThanOrEqual(LIGHT_COMMAND_GAP_MS - 40); // as the bridge saw them
+    expect(maxOverlap(log)).toBeGreaterThan(1);
+    expect(maxOverlap(log)).toBeLessThanOrEqual(MAX_IN_FLIGHT);
+  }, 15_000);
+
+  test("a light's own requests stay in order (state change, then rename)", async () => {
+    await clearPutLog(mock.url);
+    const requests = lightUpdateRequests([
+      { old: { light_id: "l-bench-1" }, body: { on: { on: false }, metadata: { name: "Renamed 1" } } },
+      { old: { light_id: "l-bench-2" }, body: { on: { on: false } } },
+      { old: { light_id: "l-bench-3" }, body: { on: { on: false } } },
+    ]);
+    expect(requests.map((r) => r.target)).toEqual(["l-bench-1", "l-bench-1", "l-bench-2", "l-bench-3"]);
+    await immediate(conn)(requests);
+    const log = await putLog(mock.url);
+    const one = log.filter((e) => e.path.endsWith("/l-bench-1"));
+    expect(one.map((e) => Object.keys(e.body))).toEqual([["on"], ["metadata"]]);
+    expect(one[1]?.start).toBeGreaterThanOrEqual(one[0]?.end as number);
+    // The other lights did not wait for light 1's first round trip.
+    const two = log.find((e) => e.path.endsWith("/l-bench-2"));
+    expect(two?.start).toBeLessThan(one[0]?.end as number);
+    const lights = await getResources<HueLight>(conn, "light");
+    expect(lights.find((l) => l.id === "l-bench-1")?.metadata?.name).toBe("Renamed 1");
+  }, 15_000);
+
+  test("a group command waits for the light commands before it, and runs alone", async () => {
+    await clearPutLog(mock.url);
+    await putAll(conn, [
+      benchLight(1),
+      benchLight(2),
+      { kind: "grouped_light", target: "gl-bench", body: { on: { on: true } } },
+      benchLight(3),
+    ]);
+    const log = await putLog(mock.url);
+    const group = log.find((e) => e.path.includes("grouped_light")) as PutLog;
+    const lightsBefore = log.filter((e) => /l-bench-[12]$/.test(e.path));
+    const after = log.find((e) => e.path.endsWith("/l-bench-3")) as PutLog;
+    for (const e of lightsBefore) expect(group.start).toBeGreaterThanOrEqual(e.end as number);
+    expect(after.start).toBeGreaterThanOrEqual(group.end as number);
+  }, 15_000);
+
+  test("COMMIT replays staged requests pipelined", async () => {
+    const tx = beginTransaction();
+    stage(
+      tx,
+      twelve().map((r) => ({ ...r, body: { dimming: { brightness: 25 } } })),
+    );
+    await clearPutLog(mock.url);
+    const t0 = performance.now();
+    const starts = await clientPutStarts(() => commitTransaction(async () => conn, tx));
+    const ms = performance.now() - t0;
+    expect(starts).toHaveLength(12);
+    expectPaced(starts);
+    const log = await putLog(mock.url);
+    expect(log).toHaveLength(12);
+    expect(ms).toBeLessThan(12 * 300 * 0.75); // includes the commit's own GETs
+    expect(minStartGapMs(log)).toBeGreaterThanOrEqual(LIGHT_COMMAND_GAP_MS - 40); // as the bridge saw them
+    expect(maxOverlap(log)).toBeGreaterThan(1);
+  }, 15_000);
+});
+
+describe("pipelined light PUTs: the in-flight cap", () => {
+  let mock: Awaited<ReturnType<typeof startMock>>;
+  beforeAll(async () => {
+    mock = await startMock({ MOCK_EXTRA_LIGHTS: "12", MOCK_LIGHT_DELAY_MS: "800" });
+  });
+  afterAll(() => mock?.proc.kill());
+
+  test(`a slow bridge never has more than ${MAX_IN_FLIGHT} requests open`, async () => {
+    await immediate({ baseUrl: mock.url, appKey: "test-key" })(twelve());
+    const log = await putLog(mock.url);
+    expect(log).toHaveLength(12);
+    expect(maxOverlap(log)).toBe(MAX_IN_FLIGHT);
+  }, 20_000);
+});
+
+describe("pipelined light PUTs: a failure part-way", () => {
+  let mock: Awaited<ReturnType<typeof startMock>>;
+  let conn: BridgeConnection;
+  beforeAll(async () => {
+    privateTxDir();
+    mock = await startMock({ MOCK_EXTRA_LIGHTS: "12", MOCK_LIGHT_DELAY_MS: "300", MOCK_FAIL_LIGHT: "l-bench-5" });
+    conn = { baseUrl: mock.url, appKey: "test-key" };
+  });
+  afterAll(() => mock?.proc.kill());
+
+  test("starts nothing after the failure, lets in-flight requests finish, throws the first error", async () => {
+    await clearPutLog(mock.url);
+    const sent: string[] = [];
+    const err = await putAll(conn, twelve(), (r) => sent.push(r.target)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(HueError);
+    expect((err as Error).message).toMatch(/^PUT \/resource\/light\/l-bench-5 failed with HTTP 500/);
+    const log = await putLog(mock.url);
+    const failed = log.find((e) => e.path.endsWith("/l-bench-5")) as PutLog;
+    expect(log.length).toBeLessThan(12);
+    expect(log.every((e) => e.end !== null)).toBe(true); // nothing still in flight when it threw
+    for (const e of log) expect(e.start).toBeLessThan((failed.end as number) + 0.05);
+    // Requests started after the failing one (still in flight then) were applied, and counted.
+    expect(sent.length).toBe(log.length - 1);
+    expect(sent).toContain("l-bench-6");
+  }, 15_000);
+
+  test("an UPDATE-style batch fails with the same error type", async () => {
+    await expect(immediate(conn)(twelve())).rejects.toThrow(/HTTP 500/);
+  }, 15_000);
+
+  test("COMMIT reports the first error and restores the lights it changed", async () => {
+    const tx = beginTransaction();
+    stage(
+      tx,
+      twelve().map((r) => ({ ...r, body: { dimming: { brightness: 77 } } })),
+    );
+    await clearPutLog(mock.url);
+    const err = (await commitTransaction(async () => conn, tx).catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(HueError);
+    expect(err.message).toMatch(
+      /^COMMIT failed after \d+ of 12 light changes: PUT \/resource\/light\/l-bench-5 failed with HTTP 500/,
+    );
+    expect(err.message).toMatch(/Restored \d+ light\(s\)/);
+    const lights = await getResources<HueLight>(conn, "light");
+    expect(lights.filter((l) => l.dimming?.brightness === 77)).toEqual([]);
+  }, 30_000);
 });

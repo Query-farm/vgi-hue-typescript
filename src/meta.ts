@@ -86,7 +86,8 @@ export const CATALOG_DOC_LLM =
   "saved lighting state for one room or zone; a sensor is a service on a device (a Hue motion " +
   "sensor also reports temperature, ambient light and battery). Inventory is exposed as " +
   "tables that always read live bridge state; the lights table also accepts UPDATE (power, " +
-  "brightness, white temperature, colour and name). Changes can also be made with table functions that send " +
+  "brightness, white temperature, colour as hex or CIE xy, gradient points and mode on gradient " +
+  "lights, effects, and name). Changes can also be made with table functions that send " +
   "a command when the query runs and return one row per change, matching targets by id or " +
   "case-insensitive name; brightness is a percentage and white temperature is in Kelvin. They " +
   "switch real lights in someone's home, so call them only when the user asks. With the ATTACH " +
@@ -107,7 +108,8 @@ export const SCHEMA_DOC_LLM =
   "Everything for the attached Hue bridge lives in `main`. The inventory tables take no " +
   "arguments and reflect the bridge at query time; filter and join them like any table. The " +
   "lights table also accepts UPDATE of `is_on`, `brightness`, `color_temperature_kelvin`, " +
-  "`color_hex` and `name`. The " +
+  "`color_hex`, `color_x`/`color_y`, `gradient_hex`/`gradient_xy`, `gradient_mode`, `effect` " +
+  "and `name`; `set_gradient(light, colors, mode := ...)` sets a gradient light's points. The " +
   "control functions take a target (id or case-insensitive name) plus named, optional state " +
   "arguments, at least one of which is required: `power := true|false` (on/off; `on` is a SQL " +
   "keyword), `brightness := 0..100` (above 0 implies on, 0 turns off), `kelvin := 2000..6500` " +
@@ -138,6 +140,10 @@ export const AGENT_TEST_TASKS = [
     prompt: "Using the hue worker, activate the Relax scene in the Living room.",
   },
   {
+    name: "strip_gradient",
+    prompt: "Using the hue worker, make the Hallway strip a gradient from red to blue.",
+  },
+  {
     name: "warm_white_everywhere",
     prompt: "Using the hue worker, set every light that supports colour temperature to 2700 K.",
   },
@@ -145,6 +151,7 @@ export const AGENT_TEST_TASKS = [
 
 export const CATALOG_TAGS: Record<string, string> = {
   "vgi.title": "VGI Hue Worker",
+  "vgi.subtitle": "Read and control Philips Hue lights, rooms, scenes and sensors from SQL.",
   "vgi.doc_llm": CATALOG_DOC_LLM,
   "vgi.doc_md": CATALOG_DOC_MD,
   "vgi.source_url": SOURCE_URL,

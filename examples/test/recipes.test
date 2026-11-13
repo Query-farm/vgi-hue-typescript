@@ -47,6 +47,17 @@ SELECT count(*) FROM pushdown_sqlite.main.orders() WHERE region IN ('north', 'ea
 ----
 1000
 
+# NOT IN must not widen to every row.
+query I
+SELECT count(*) FROM pushdown_sqlite.main.orders() WHERE region NOT IN ('north', 'east');
+----
+1000
+
+query I
+SELECT count(*) FROM pushdown_sqlite.main.orders() WHERE region NOT IN ('north', 'east', 'south');
+----
+500
+
 # ------------------------------------------------------- cache_expensive_call
 statement ok
 ATTACH 'cache_expensive_call' (TYPE vgi, LOCATION '{RECIPES_WORKER} cache_expensive_call');

@@ -74,7 +74,7 @@ it; use it only on a network you trust. `LOCATION` must be an absolute path.
 
 | Table | One row per |
 |---|---|
-| `hue.main.lights` | light: `light_id`, `name`, `room`, `is_on`, `brightness` (0–100), `color_mode`, `color_temperature_kelvin`, `color_x`/`color_y`, `color_hex`, `reachable`, `product_name`, `model_id`, `device_id` |
+| `hue.main.lights` | light: `light_id`, `name`, `room`, `archetype`, `is_on`, `brightness` (0–100), `color_mode`, `color_temperature_kelvin`, `color_x`/`color_y`, `color_hex`, `gradient_hex`, `gradient_xy`, `gradient_mode`, `gradient_points_capable`, `gradient_pixel_count`, `effect`, `reachable`, `product_name`, `model_id`, `device_id` |
 | `hue.main.rooms` | room or zone: `room_id`, `name`, `kind`, `archetype`, `grouped_light_id`, `any_on`, `brightness`, `light_count`, `light_names` |
 | `hue.main.scenes` | scene: `scene_id`, `name`, `room`, `room_id`, `active` |
 | `hue.main.sensors` | sensor reading (none shown for a disabled sensor): `kind` ∈ motion / temperature / light_level / contact / device_power, with `motion`, `temperature_c`, `light_level_lux`, `contact`, `battery_percent`, `battery_state`, `reachable`, `last_changed` |
@@ -107,12 +107,95 @@ UPDATE hue.main.lights SET name = 'Reading lamp' WHERE name = 'Desk lamp';
 | `brightness` | 0–100 (above 0 turns the light on unless `is_on` says otherwise; 0 turns it off) |
 | `color_temperature_kelvin` | 2000–6500 |
 | `color_hex` | `'#rrggbb'`, `'#rgb'` or a basic colour name |
+| `color_x`, `color_y` | CIE 1931 xy, each 0–1; sent as is (see [Colours](#colours-hex-or-xy)) |
+| `gradient_hex`, `gradient_xy` | the points of a gradient light (see [Gradients](#gradients)) |
+| `gradient_mode` | one of the light's gradient modes |
+| `effect` | one of the light's effects; `'no_effect'` stops it (see [Effects](#effects)) |
 | `name` | 1–32 characters; renames the light on the bridge |
 
 Every other column belongs to the bridge or the device, and changing it is refused before
-anything is sent. Each light gets one command, paced at about 10 per second. `RETURNING` shows
+anything is sent. Each light gets one command (a rename with a state change gets two). `RETURNING` shows
 the rows as written. Each light has a stable `rowid`, a hash of its id, which is how DuckDB
 tells the worker which lights matched.
+
+### Colours: hex or xy
+
+A colour light has two views of its colour. `color_hex` is the friendly one: SET it to
+`'#rrggbb'` (or `'red'`, `'orange'`, ...) and the worker converts it to the CIE 1931 xy
+coordinates the bridge works in. Reading it back gives a full-brightness approximation of what
+the bridge reports, so it can differ slightly from what you set. `color_x` / `color_y` are
+those coordinates themselves (each 0–1); SET them for an exact colour with no hex round trip:
+
+```sql
+UPDATE hue.main.lights SET color_x = 0.17, color_y = 0.7 WHERE name = 'Sofa lamp';   -- green
+UPDATE hue.main.lights SET color_y = 0.3 WHERE name = 'Sofa lamp';   -- color_x keeps its value
+```
+
+- Setting only one coordinate keeps the light's current value for the other.
+- Setting a colour (either way) switches `color_mode` to `'xy'`.
+- `RETURNING` shows the xy you asked for. The bridge may clamp it to what the lamp can show (its
+  gamut), so a later read can show slightly different coordinates.
+- `color_hex` and `color_x`/`color_y` in one statement are refused (`set either color_hex or
+  color_x/color_y, not both`), as are coordinates outside 0–1 and xy on a light without colour
+  (`light 'Kitchen pendant' does not support color`).
+
+### Gradients
+
+Gradient lights (Hue gradient lightstrips, Play gradient, Festavia, ...) show several colours at
+once. For them the table fills `gradient_points_capable` (how many points the light takes),
+`gradient_pixel_count` (how many segments it lights individually), the points themselves as
+`gradient_hex` (`VARCHAR[]` of `'#rrggbb'`) and `gradient_xy` (`STRUCT(x DOUBLE, y DOUBLE)[]`),
+and `gradient_mode`: how the points are spread (`interpolated_palette`,
+`interpolated_palette_mirrored`, `random_pixelated`, `segmented_palette`, whichever the light
+lists). Other lights have NULL in all of them.
+
+```sql
+SELECT name, gradient_hex, gradient_mode FROM hue.main.lights WHERE gradient_points_capable IS NOT NULL;
+
+UPDATE hue.main.lights SET gradient_hex = ['#ff0000', '#ff8000', '#0000ff'] WHERE name = 'Hallway strip';
+UPDATE hue.main.lights SET gradient_xy = [{'x': 0.2, 'y': 0.3}, {'x': 0.6, 'y': 0.35}] WHERE name = 'Hallway strip';
+UPDATE hue.main.lights SET gradient_mode = 'segmented_palette' WHERE name = 'Hallway strip';   -- keeps the points
+
+SELECT * FROM hue.main.set_gradient('Hallway strip', ['#00ff00', '#0000ff'], mode := 'random_pixelated');
+```
+
+- A gradient needs 2 to `gradient_points_capable` points (the bridge refuses fewer); NULL points, coordinates outside 0–1 and
+  modes the light doesn't list are refused before anything is sent.
+- `gradient_hex` and `gradient_xy` can't both be set in one statement, and a gradient can't be
+  set together with a single colour (`color_hex`, `color_x`/`color_y`,
+  `color_temperature_kelvin`): they'd fight over the same light.
+- `gradient_mode` alone re-sends the light's current points with the new mode (the bridge wants
+  the points with every gradient change). On a light with no gradient left (after a single
+  colour) it is refused before anything is sent: "light '<name>' has no gradient to change the
+  mode of; set gradient_hex or gradient_xy too".
+- Setting a single colour or white temperature on a gradient light replaces the gradient: the
+  bridge then lists no points, and `gradient_hex` reads `[]`.
+- `set_gradient(light, colors, mode := 'interpolated_palette')` does the same as a function:
+  `light` is an id or name (as for `set_light`), `colors` a list of `'#rrggbb'` colours.
+
+### Effects
+
+Lights with built-in effects show the running one in `effect` (`'no_effect'` when none; NULL for
+lights without effects). SET it to one of the light's effects (on a colour bulb typically
+`candle`, `fire`, `prism`, `sparkle`, `opal`, `glisten`) and back to `'no_effect'` to stop it.
+An effect the light doesn't list is refused with the list it does.
+
+```sql
+UPDATE hue.main.lights SET effect = 'candle' WHERE room = 'Living room' AND effect IS NOT NULL;
+UPDATE hue.main.lights SET effect = 'no_effect' WHERE effect <> 'no_effect';
+```
+
+All of these stage in a transactional attach and go out at `COMMIT` like any other light change.
+
+**Pacing.** Hue asks for at most about 10 light commands and 1 room or scene command per
+second. The worker starts light commands 100 ms apart (room and scene commands 1 s apart) and
+doesn't wait for each answer before starting the next: up to 4 requests are in flight at once,
+so 12 lights take about 1.2 s plus one round trip instead of 12 round trips. Requests for the
+same light still go one after another, in order, and a room or scene command waits for the
+commands before it and runs alone. If the bridge refuses one, no further request starts, the
+ones already in flight finish, and the statement fails with the first refusal; lights already
+changed stay changed (in a transactional commit they are put back, see below). `COMMIT` sends
+its staged requests the same way.
 
 ## Transactions
 
@@ -125,7 +208,7 @@ BEGIN;
 UPDATE hue.main.lights SET is_on = true, brightness = 40 WHERE room = 'Kitchen';
 SELECT * FROM hue.main.recall_scene('Relax', room := 'Living room');
 SELECT name, brightness FROM hue.main.lights WHERE room = 'Kitchen';  -- shows 40: your pending change
-COMMIT;      -- everything is sent now, back to back
+COMMIT;      -- everything is sent now, paced and pipelined (see Pacing)
 -- or ROLLBACK: nothing was sent, no light changed
 ```
 
@@ -151,6 +234,7 @@ Without `transactional`, every change is sent as its statement runs, which is th
 | Function | Changes |
 |---|---|
 | `set_light(light, ...)` | one light, by id or (case-insensitive) name |
+| `set_gradient(light, colors, mode := 'interpolated_palette')` | the points of a gradient light (see [Gradients](#gradients)) |
 | `set_room(room, ..., wait_ms := NULL)` | every light in a room or zone at once (its grouped light); `wait_ms` waits until the bulbs report the change |
 | `recall_scene(scene, room := NULL)` | activates a scene, by id or name (+ room when the name repeats) |
 | `set_lights((query), ...)` | every light a query returns; the query needs a `light_id` column |

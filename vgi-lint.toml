@@ -14,15 +14,7 @@ fail_on = "warning"
 #   deferred          a real defect you will fix; add expires = "YYYY-MM-DD"
 #   timing            slow or flaky because of the environment, not the metadata
 #   tooling-bug       the linter is wrong; report it upstream
-ignore = [
-  # lights_scan backs the hue.main.lights table. It is also listed as a function only so
-  # DuckDB learns that it supports projection pushdown, which the rowid virtual column (and
-  # so UPDATE) needs. Tables with explicit columns resolve their scan per call, so the linter
-  # cannot see that the function is already exposed as a table, and agents should query the
-  # table rather than the scan.
-  { code = "VGI311", object = "hue.main.lights_scan", kind = "domain-exemption", reason = "scan behind hue.main.lights, listed only to advertise projection pushdown for rowid/UPDATE" },
-  { code = "VGI520", object = "hue.main.lights_scan", kind = "domain-exemption", reason = "agents query hue.main.lights; the scan is plumbing for UPDATE" },
-]
+ignore = []
 
 # Adopting the gate on a worker that already has findings? Record them once with
 #   vgi-lint lint --baseline vgi-lint-baseline --update-baseline

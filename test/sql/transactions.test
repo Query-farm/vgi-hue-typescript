@@ -121,6 +121,95 @@ SELECT brightness, color_mode FROM bridge.main.lights WHERE light_id = 'l-sofa';
 ----
 15.0	xy
 
+# ------------------------------------------------ gradients and effects stage too
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE tx.main.lights SET gradient_hex = ['#ff8000', '#0000ff'] WHERE light_id = 'l-strip';
+
+# The mode alone, after the staged points: re-sends the staged points.
+statement ok
+UPDATE tx.main.lights SET gradient_mode = 'segmented_palette', effect = 'prism' WHERE light_id = 'l-strip';
+
+query TTT
+SELECT gradient_hex, gradient_mode, effect FROM tx.main.lights WHERE light_id = 'l-strip';
+----
+[#ff8000, #0000ff]	segmented_palette	prism
+
+query TTT
+SELECT gradient_hex, gradient_mode, effect FROM bridge.main.lights WHERE light_id = 'l-strip';
+----
+[#ff0000, #00ff00, #0000ff]	interpolated_palette	no_effect
+
+statement ok
+COMMIT;
+
+query TTT
+SELECT gradient_hex, gradient_mode, effect FROM bridge.main.lights WHERE light_id = 'l-strip';
+----
+[#ff8000, #0000ff]	segmented_palette	prism
+
+statement ok
+BEGIN;
+
+query TT
+SELECT name, ok FROM tx.main.set_gradient('Hallway strip', ['#00ff00', '#ff0000', '#0000ff']);
+----
+Hallway strip	true
+
+statement ok
+UPDATE tx.main.lights SET color_x = 0.2, color_y = 0.6 WHERE light_id = 'l-sofa';
+
+query TRR
+SELECT gradient_hex, (SELECT color_x FROM tx.main.lights WHERE light_id = 'l-sofa'), (SELECT color_y FROM tx.main.lights WHERE light_id = 'l-sofa')
+FROM tx.main.lights WHERE light_id = 'l-strip';
+----
+[#00ff00, #ff0000, #0000ff]	0.2	0.6
+
+statement ok
+ROLLBACK;
+
+query TTR
+SELECT gradient_hex, gradient_mode, (SELECT color_y FROM bridge.main.lights WHERE light_id = 'l-sofa')
+FROM bridge.main.lights WHERE light_id = 'l-strip';
+----
+[#ff8000, #0000ff]	segmented_palette	0.0399
+
+# A refused gradient at UPDATE time stages nothing.
+statement ok
+BEGIN;
+
+statement error
+UPDATE tx.main.lights SET gradient_mode = 'swirl' WHERE light_id = 'l-strip';
+----
+invalid gradient_mode 'swirl'
+
+statement ok
+ROLLBACK;
+
+# A staged single colour clears the gradient as the transaction sees it, so
+# gradient_mode alone is refused there, before anything is staged or sent.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE tx.main.lights SET color_hex = '#0000ff' WHERE light_id = 'l-strip';
+
+statement error
+UPDATE tx.main.lights SET gradient_mode = 'random_pixelated' WHERE light_id = 'l-strip';
+----
+light 'Hallway strip' has no gradient to change the mode of; set gradient_hex or gradient_xy too
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT gradient_hex FROM bridge.main.lights WHERE light_id = 'l-strip';
+----
+[#ff8000, #0000ff]
+
 # ------------------------------------------- a refused commit puts lights back
 
 # The white-only pendant cannot take a colour: the bridge refuses it at

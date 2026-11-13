@@ -12,11 +12,13 @@ import {
   bool,
   constraintRecord,
   defineTableFunction,
+  field,
   float64,
   int32,
   list,
   rowIdField,
   schema,
+  struct,
   type TableDescriptor,
   type TableProcessParams,
   timestampMicros,
@@ -40,6 +42,7 @@ import {
   mirekToKelvin,
   reachableByDevice,
   roomByDevice,
+  type Xy,
   xyToHex,
 } from "./hue.ts";
 import { objectTags, resultColumns } from "./meta.ts";
@@ -150,7 +153,14 @@ export function applyToRow(old: Row, body: Record<string, unknown>): Row {
     dimming?: { brightness: number };
     color_temperature?: { mirek: number };
     color?: { xy: { x: number; y: number } };
+    gradient?: { points: { color: { xy: Xy } }[]; mode?: string };
+    effects?: { effect: string };
     metadata?: { name: string };
+  };
+  // A single colour or white temperature replaces a gradient light's gradient
+  // (the bridge then lists no points).
+  const dropGradient = () => {
+    if (row.gradient_xy != null) Object.assign(row, { gradient_xy: [], gradient_hex: [] });
   };
   if (b.on) row.is_on = b.on.on;
   if (b.dimming) row.brightness = b.dimming.brightness;
@@ -161,6 +171,7 @@ export function applyToRow(old: Row, body: Record<string, unknown>): Row {
       color_temperature_kelvin: kelvin,
       color_hex: kelvinToHex(kelvin),
     });
+    dropGradient();
   }
   if (b.color) {
     const { x, y } = b.color.xy;
@@ -171,7 +182,26 @@ export function applyToRow(old: Row, body: Record<string, unknown>): Row {
       color_y: y,
       color_hex: xyToHex(x, y),
     });
+    dropGradient();
   }
+  if (b.gradient) {
+    const points = b.gradient.points.map((p) => ({ x: p.color.xy.x, y: p.color.xy.y }));
+    row.gradient_xy = points;
+    row.gradient_hex = points.map((p) => xyToHex(p.x, p.y));
+    if (b.gradient.mode != null) row.gradient_mode = b.gradient.mode;
+    // The bridge sets the light's colour to the first gradient point.
+    const first = points[0];
+    if (first) {
+      Object.assign(row, {
+        color_mode: "xy",
+        color_temperature_kelvin: null,
+        color_x: first.x,
+        color_y: first.y,
+        color_hex: xyToHex(first.x, first.y),
+      });
+    }
+  }
+  if (b.effects) row.effect = b.effects.effect;
   if (b.metadata) row.name = b.metadata.name;
   return row;
 }
@@ -223,9 +253,55 @@ export const LIGHTS = resultColumns([
   ],
   ["color_mode", utf8(), "VARCHAR", "'color_temperature', 'xy', or NULL for white-only/dimmable lights."],
   ["color_temperature_kelvin", int32, "INTEGER", "Colour temperature in Kelvin when in color_temperature mode."],
-  ["color_x", float64(), "DOUBLE", "CIE 1931 x chromaticity coordinate of the current colour, 0–1 (unitless)."],
-  ["color_y", float64(), "DOUBLE", "CIE 1931 y chromaticity coordinate of the current colour, 0–1 (unitless)."],
+  [
+    "color_x",
+    float64(),
+    "DOUBLE",
+    "CIE 1931 x chromaticity of the current colour, 0–1 (unitless). Updatable: SET color_x/color_y sends that xy directly (the other coordinate keeps its current value); the bridge may clamp it to the lamp's gamut.",
+  ],
+  [
+    "color_y",
+    float64(),
+    "DOUBLE",
+    "CIE 1931 y chromaticity of the current colour, 0–1 (unitless). Updatable together with or without color_x; see color_x.",
+  ],
   ["color_hex", utf8(), "VARCHAR", "Approximate current colour as '#rrggbb' (full brightness)."],
+  [
+    "gradient_hex",
+    list(utf8()),
+    "VARCHAR[]",
+    "Gradient points as '#rrggbb' (full-brightness approximation), or NULL for lights without a gradient. Updatable: SET it to 2..gradient_points_capable colours.",
+  ],
+  [
+    "gradient_xy",
+    list(struct([field("x", float64()), field("y", float64())])),
+    "STRUCT(x DOUBLE, y DOUBLE)[]",
+    "The same gradient points as CIE 1931 xy (each 0–1), or NULL for lights without a gradient. Updatable like gradient_hex, without the hex round trip.",
+  ],
+  [
+    "gradient_mode",
+    utf8(),
+    "VARCHAR",
+    "How the gradient points are spread over the light: 'interpolated_palette', 'interpolated_palette_mirrored', 'random_pixelated' or 'segmented_palette' (whatever the light lists); NULL for lights without a gradient. Updatable.",
+  ],
+  [
+    "gradient_points_capable",
+    int32,
+    "INTEGER",
+    "Maximum number of gradient points the light accepts; NULL for lights without a gradient.",
+  ],
+  [
+    "gradient_pixel_count",
+    int32,
+    "INTEGER",
+    "Number of individually lit segments of the gradient light; NULL for lights without a gradient.",
+  ],
+  [
+    "effect",
+    utf8(),
+    "VARCHAR",
+    "Running light effect, e.g. 'candle', 'fire', 'prism'; 'no_effect' when none; NULL for lights without effects. Updatable: SET effect = 'no_effect' stops it.",
+  ],
   ["reachable", bool, "BOOLEAN", "Whether the bridge can currently reach the light over Zigbee."],
   ["product_name", utf8(), "VARCHAR", "Product name, e.g. 'Hue color lamp'."],
   ["model_id", utf8(), "VARCHAR", "Hardware model id, e.g. 'LCA001'."],
@@ -245,6 +321,11 @@ export function lightRowId(id: string): bigint {
     h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
   }
   return h & 0x3fffffffffffffffn;
+}
+
+/** A gradient light's points as xy (points without a colour are skipped). */
+export function gradientPoints(l: HueLight): Xy[] {
+  return (l.gradient?.points ?? []).flatMap((p) => (p.color?.xy ? [{ x: p.color.xy.x, y: p.color.xy.y }] : []));
 }
 
 export function lightRows(lights: HueLight[], devices: HueDevice[], groups: HueGroup[], zigbee: HueZigbee[]): Columns {
@@ -277,6 +358,17 @@ export function lightRows(lights: HueLight[], devices: HueDevice[], groups: HueG
     push("color_x", xy?.x);
     push("color_y", xy?.y);
     push("color_hex", kelvin != null ? kelvinToHex(kelvin) : xy ? xyToHex(xy.x, xy.y) : null);
+    const g = l.gradient;
+    const points = g ? gradientPoints(l) : null;
+    push(
+      "gradient_hex",
+      points?.map((p) => xyToHex(p.x, p.y)),
+    );
+    push("gradient_xy", points);
+    push("gradient_mode", g?.mode);
+    push("gradient_points_capable", g?.points_capable);
+    push("gradient_pixel_count", g?.pixel_count);
+    push("effect", l.effects ? (l.effects.status ?? "no_effect") : null);
     push("reachable", reachable.get(l.owner.rid));
     push("product_name", device?.product_data?.product_name);
     push("model_id", device?.product_data?.model_id);
@@ -302,17 +394,11 @@ export const lightsTable = inventoryTable({
       keywords: "hue, lights, scan, rowid, update",
       docLlm:
         "The table function behind `hue.main.lights`: the same rows, plus DuckDB's `rowid` when " +
-        "it is selected. Query the `hue.main.lights` table instead; this function exists so DuckDB " +
-        "can scan the table for UPDATE.",
+        "it is selected. It is table-only (not callable from SQL): query the `hue.main.lights` " +
+        "table instead; DuckDB uses this function to scan the table, including for UPDATE.",
       docMd: "## lights_scan()\n\nThe scan behind `hue.main.lights`; query the table instead.",
     }),
   },
-  scanExamples: [
-    {
-      sql: "SELECT name, is_on FROM hue.main.lights_scan() WHERE room = 'Kitchen' ORDER BY name",
-      description: "The kitchen's lights, read through the scan function",
-    },
-  ],
   description: "Every light on the Hue bridge with its room, on/off state, brightness and colour",
   load: async (params) => {
     const c = await conn(params);
@@ -332,15 +418,24 @@ export const lightsTable = inventoryTable({
       docLlm:
         "List every light on the attached Hue bridge, one row per light, with its current state: " +
         "`light_id`, `name`, `room`, `is_on`, `brightness` (0–100), colour (`color_mode`, " +
-        "`color_temperature_kelvin`, `color_x`/`color_y`, approximate `color_hex`), `reachable`, " +
-        "and hardware details. Takes no arguments. The table is writable with UPDATE: WHERE " +
-        "picks the lights and SET changes them. Updatable columns are `is_on`, `brightness`, " +
-        "`color_temperature_kelvin`, `color_hex` ('#rrggbb' or a basic colour name) and `name` " +
-        "(renames the light); RETURNING shows the rows as written. Other columns belong to the " +
-        "bridge and cannot be updated. `set_light` and `set_lights` do the same through functions.",
+        "`color_temperature_kelvin`, CIE 1931 `color_x`/`color_y`, approximate `color_hex`), " +
+        "gradient (`gradient_hex` as `VARCHAR[]`, `gradient_xy` as `STRUCT(x DOUBLE, y DOUBLE)[]`, `gradient_mode`, " +
+        "`gradient_points_capable`, `gradient_pixel_count`; all NULL for lights without a " +
+        "gradient), `effect` ('no_effect' when none, NULL for lights without effects), " +
+        "`reachable`, and hardware details. Takes no arguments. The table is writable with " +
+        "UPDATE: WHERE picks the lights and SET changes them. Updatable columns are `is_on`, " +
+        "`brightness`, `color_temperature_kelvin`, `color_hex` ('#rrggbb' or a basic colour " +
+        "name), `color_x`/`color_y` (an exact xy colour, 0–1; setting one keeps the other; not " +
+        "together with `color_hex`), `gradient_hex` or `gradient_xy` (2 to " +
+        "`gradient_points_capable` points), `gradient_mode` (one of the light's modes), `effect` " +
+        "(one of the light's effects, e.g. 'candle'; 'no_effect' stops it) and `name` (renames " +
+        "the light). A gradient cannot be set in the same statement as a single colour. " +
+        "RETURNING shows the rows as written. Other columns belong to the bridge and cannot be " +
+        "updated. `set_light`, `set_lights` and `set_gradient` do the same through functions.",
       docMd:
         "## lights\n\nEvery light on the bridge with its current state and room. Writable: " +
-        "UPDATE its `is_on`, `brightness`, `color_temperature_kelvin`, `color_hex` or `name`.",
+        "UPDATE its `is_on`, `brightness`, `color_temperature_kelvin`, `color_hex`, " +
+        "`color_x`/`color_y`, `gradient_hex`/`gradient_xy`, `gradient_mode`, `effect` or `name`.",
     }),
   },
   examples: [
@@ -353,6 +448,14 @@ export const lightsTable = inventoryTable({
       description: "How many lights are on in each room",
     },
     {
+      sql: "UPDATE hue.main.lights SET gradient_hex = ['#ff0000', '#0000ff'], gradient_mode = 'segmented_palette' WHERE gradient_points_capable >= 2 RETURNING name, gradient_hex",
+      description: "Give every gradient light a red and blue gradient in two segments",
+    },
+    {
+      sql: "UPDATE hue.main.lights SET effect = 'candle' WHERE room = 'Living room' AND effect IS NOT NULL RETURNING name, effect",
+      description: "Start the candle effect on every living-room light that has effects",
+    },
+    {
       sql: "SELECT name, room FROM hue.main.lights WHERE NOT reachable ORDER BY name",
       description: "Lights the bridge cannot reach (unplugged or switched off at the wall)",
     },
@@ -362,10 +465,11 @@ export const lightsTable = inventoryTable({
       description: "The state columns of the lights table (reads only its schema, so no bridge is needed)",
       sql:
         "SELECT column_name, column_type FROM (DESCRIBE hue.main.lights) " +
-        "WHERE column_name IN ('light_id', 'is_on', 'brightness', 'color_temperature_kelvin') ORDER BY column_name",
+        "WHERE column_name IN ('light_id', 'is_on', 'brightness', 'color_temperature_kelvin', 'gradient_xy') ORDER BY column_name",
       expected_result: [
         { column_name: "brightness", column_type: "DOUBLE" },
         { column_name: "color_temperature_kelvin", column_type: "INTEGER" },
+        { column_name: "gradient_xy", column_type: "STRUCT(x DOUBLE, y DOUBLE)[]" },
         { column_name: "is_on", column_type: "BOOLEAN" },
         { column_name: "light_id", column_type: "VARCHAR" },
       ],
