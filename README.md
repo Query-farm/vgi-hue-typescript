@@ -339,3 +339,7 @@ has the conventions for coding agents.
 ## License
 
 [BSD Zero Clause License](LICENSE) (0BSD).
+
+## Notebooks
+
+[Executed inventory and battery policy walkthrough](notebooks/README.md).
