@@ -41,3 +41,8 @@ Reported brightness is a setting, not lumens or electricity use; even reachable/
 ## Real bridge setup is separate
 
 The root README documents pairing and live access. A separate reader-authored live analysis would need an authorized bridge endpoint and an application key supplied as a secret/environment setting, plus a decision about freshness and reachability. This notebook has no live switch and does not pair, discover or control real devices. Do not replace fixture values and then claim its synthetic provenance or checks still apply.
+
+The Haybarn connection uses an empty temporary SQL secret directory with persistent
+secrets disabled. The selected worker path receives only explicit fixture dummy
+credentials. Assertions confirm no SQL secrets exist before ATTACH or at cleanup.
+Existing saved SQL credentials are neither loaded nor modified.
